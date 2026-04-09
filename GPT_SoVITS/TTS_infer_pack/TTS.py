@@ -30,6 +30,7 @@ from peft import LoraConfig, get_peft_model
 from process_ckpt import get_sovits_version_from_path_fast, load_sovits_new
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
+from tools.audio_utils import load_audio_tensor
 from tools.audio_sr import AP_BWE
 from tools.i18n.i18n import I18nAuto, scan_language_list
 from TTS_infer_pack.text_segmentation_method import splits
@@ -770,7 +771,7 @@ class TTS:
             self.prompt_cache["refer_spec"][0] = spec_audio
 
     def _get_ref_spec(self, ref_audio_path):
-        raw_audio, raw_sr = torchaudio.load(ref_audio_path)
+        raw_audio, raw_sr = load_audio_tensor(ref_audio_path)
         raw_audio = raw_audio.to(self.configs.device).float()
         self.prompt_cache["raw_audio"] = raw_audio
         self.prompt_cache["raw_sr"] = raw_sr

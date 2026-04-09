@@ -166,6 +166,7 @@ from io import BytesIO
 from module.models import Generator, SynthesizerTrn, SynthesizerTrnV3
 from peft import LoraConfig, get_peft_model
 from AR.models.t2s_lightning_module import Text2SemanticLightningModule
+from tools.audio_utils import load_audio_tensor
 from text import cleaned_text_to_sequence
 from text.cleaner import clean_text
 from module.mel_processing import spectrogram_torch
@@ -639,7 +640,7 @@ class DictToAttrRecursive(dict):
 
 def get_spepc(hps, filename, dtype, device, is_v2pro=False):
     sr1 = int(hps.data.sampling_rate)
-    audio, sr0 = torchaudio.load(filename)
+    audio, sr0 = load_audio_tensor(filename)
     if sr0 != sr1:
         audio = audio.to(device)
         if audio.shape[0] == 2:
@@ -974,7 +975,7 @@ def get_tts_wav(
             phoneme_ids1 = torch.LongTensor(phones2).to(device).unsqueeze(0)
 
             fea_ref, ge = vq_model.decode_encp(prompt.unsqueeze(0), phoneme_ids0, refer)
-            ref_audio, sr = torchaudio.load(ref_wav_path)
+            ref_audio, sr = load_audio_tensor(ref_wav_path)
             ref_audio = ref_audio.to(device).float()
             if ref_audio.shape[0] == 2:
                 ref_audio = ref_audio.mean(0).unsqueeze(0)

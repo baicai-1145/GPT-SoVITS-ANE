@@ -193,3 +193,4 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+.playwright-mcp/page-2026-04-09T19-13-09-115Z.yml

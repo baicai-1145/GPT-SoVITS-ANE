@@ -58,20 +58,15 @@ run_wget_quiet() {
     fi
 }
 
-if ! command -v conda &>/dev/null; then
-    echo -e "${ERROR}Conda Not Found"
-    exit 1
-fi
-
 USE_CUDA=false
 USE_ROCM=false
 USE_CPU=false
 WORKFLOW=${WORKFLOW:-"false"}
+MODEL_VERSION=""
 
 USE_HF=false
 USE_HF_MIRROR=false
 USE_MODELSCOPE=false
-DOWNLOAD_UVR5=false
 
 print_help() {
     echo "Usage: bash install.sh [OPTIONS]"
@@ -79,12 +74,13 @@ print_help() {
     echo "Options:"
     echo "  --device   CU126|CU128|ROCM|MPS|CPU    Specify the Device (REQUIRED)"
     echo "  --source   HF|HF-Mirror|ModelScope     Specify the model source (REQUIRED)"
-    echo "  --download-uvr5                        Enable downloading the UVR5 model"
+    echo "  --version  v1|v2|v3|v4|v2Pro|v2ProPlus|all"
+    echo "                                            Specify which inference pretrained files to download (REQUIRED)"
     echo "  -h, --help                             Show this help message and exit"
     echo ""
     echo "Examples:"
-    echo "  bash install.sh --device CU128 --source HF --download-uvr5"
-    echo "  bash install.sh --device MPS --source ModelScope"
+    echo "  bash install.sh --device CU128 --source HF --version v2Pro"
+    echo "  bash install.sh --device MPS --source ModelScope --version all"
 }
 
 # Show help if no arguments provided
@@ -142,9 +138,18 @@ while [[ $# -gt 0 ]]; do
         esac
         shift 2
         ;;
-    --download-uvr5)
-        DOWNLOAD_UVR5=true
-        shift
+    --version)
+        case "$2" in
+        v1 | v2 | v3 | v4 | v2Pro | v2ProPlus | all)
+            MODEL_VERSION="$2"
+            ;;
+        *)
+            echo -e "${ERROR}Error: Invalid Version: $2"
+            echo -e "${ERROR}Choose From: [v1, v2, v3, v4, v2Pro, v2ProPlus, all]"
+            exit 1
+            ;;
+        esac
+        shift 2
         ;;
     -h | --help)
         print_help
@@ -170,6 +175,18 @@ if ! $USE_HF && ! $USE_HF_MIRROR && ! $USE_MODELSCOPE; then
     echo -e "${ERROR}Error: Download Source is REQUIRED"
     echo ""
     print_help
+    exit 1
+fi
+
+if [ -z "$MODEL_VERSION" ]; then
+    echo -e "${ERROR}Error: Version is REQUIRED"
+    echo ""
+    print_help
+    exit 1
+fi
+
+if ! command -v conda &>/dev/null; then
+    echo -e "${ERROR}Conda Not Found"
     exit 1
 fi
 
@@ -233,39 +250,104 @@ echo -e "${SUCCESS}unzip Installed"
 
 if [ "$USE_HF" = "true" ]; then
     echo -e "${INFO}Download Model From HuggingFace"
-    PRETRINED_URL="https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/pretrained_models.zip"
+    REPO_FILE_URL_PREFIX="https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main"
     G2PW_URL="https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/G2PWModel.zip"
-    UVR5_URL="https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/uvr5_weights.zip"
     NLTK_URL="https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/nltk_data.zip"
     PYOPENJTALK_URL="https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/open_jtalk_dic_utf_8-1.11.tar.gz"
 elif [ "$USE_HF_MIRROR" = "true" ]; then
     echo -e "${INFO}Download Model From HuggingFace-Mirror"
-    PRETRINED_URL="https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/pretrained_models.zip"
+    REPO_FILE_URL_PREFIX="https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main"
     G2PW_URL="https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/G2PWModel.zip"
-    UVR5_URL="https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/uvr5_weights.zip"
     NLTK_URL="https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/nltk_data.zip"
     PYOPENJTALK_URL="https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/open_jtalk_dic_utf_8-1.11.tar.gz"
 elif [ "$USE_MODELSCOPE" = "true" ]; then
     echo -e "${INFO}Download Model From ModelScope"
-    PRETRINED_URL="https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/pretrained_models.zip"
+    REPO_FILE_URL_PREFIX="https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master"
     G2PW_URL="https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/G2PWModel.zip"
-    UVR5_URL="https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/uvr5_weights.zip"
     NLTK_URL="https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/nltk_data.zip"
     PYOPENJTALK_URL="https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/open_jtalk_dic_utf_8-1.11.tar.gz"
 fi
 
-if [ ! -d "GPT_SoVITS/pretrained_models/sv" ]; then
-    echo -e "${INFO}Downloading Pretrained Models..."
-    rm -rf pretrained_models.zip
-    run_wget_quiet "$PRETRINED_URL"
+download_repo_file_if_missing() {
+    local relative_path="$1"
+    local local_path="GPT_SoVITS/${relative_path}"
+    local remote_url="${REPO_FILE_URL_PREFIX}/${relative_path}"
 
-    unzip -q -o pretrained_models.zip -d GPT_SoVITS
-    rm -rf pretrained_models.zip
-    echo -e "${SUCCESS}Pretrained Models Downloaded"
-else
-    echo -e "${INFO}Pretrained Model Exists"
-    echo -e "${INFO}Skip Downloading Pretrained Models"
-fi
+    if [ -f "$local_path" ]; then
+        echo -e "${INFO}File Exists: ${local_path}"
+        return
+    fi
+
+    mkdir -p "$(dirname "$local_path")"
+    echo -e "${INFO}Downloading ${relative_path}..."
+    run_wget_quiet "$remote_url" -O "$local_path"
+    echo -e "${SUCCESS}Downloaded ${relative_path}"
+}
+
+download_shared_inference_files() {
+    download_repo_file_if_missing "pretrained_models/chinese-hubert-base/config.json"
+    download_repo_file_if_missing "pretrained_models/chinese-hubert-base/preprocessor_config.json"
+    download_repo_file_if_missing "pretrained_models/chinese-hubert-base/pytorch_model.bin"
+
+    download_repo_file_if_missing "pretrained_models/chinese-roberta-wwm-ext-large/config.json"
+    download_repo_file_if_missing "pretrained_models/chinese-roberta-wwm-ext-large/pytorch_model.bin"
+    download_repo_file_if_missing "pretrained_models/chinese-roberta-wwm-ext-large/tokenizer.json"
+
+    download_repo_file_if_missing "pretrained_models/fast_langdetect/lid.176.bin"
+    download_repo_file_if_missing "pretrained_models/fast_langdetect/lid.176.ftz"
+}
+
+download_version_files() {
+    case "$1" in
+    v1)
+        download_repo_file_if_missing "pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt"
+        download_repo_file_if_missing "pretrained_models/s2G488k.pth"
+        ;;
+    v2)
+        download_repo_file_if_missing "pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"
+        download_repo_file_if_missing "pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"
+        ;;
+    v3)
+        download_repo_file_if_missing "pretrained_models/s1v3.ckpt"
+        download_repo_file_if_missing "pretrained_models/s2Gv3.pth"
+        download_repo_file_if_missing "pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/bigvgan_generator.pt"
+        download_repo_file_if_missing "pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/config.json"
+        ;;
+    v4)
+        download_repo_file_if_missing "pretrained_models/s1v3.ckpt"
+        download_repo_file_if_missing "pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
+        download_repo_file_if_missing "pretrained_models/gsv-v4-pretrained/vocoder.pth"
+        ;;
+    v2Pro)
+        download_repo_file_if_missing "pretrained_models/s1v3.ckpt"
+        download_repo_file_if_missing "pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt"
+        download_repo_file_if_missing "pretrained_models/v2Pro/s2Gv2Pro.pth"
+        ;;
+    v2ProPlus)
+        download_repo_file_if_missing "pretrained_models/s1v3.ckpt"
+        download_repo_file_if_missing "pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt"
+        download_repo_file_if_missing "pretrained_models/v2Pro/s2Gv2ProPlus.pth"
+        ;;
+    all)
+        download_version_files v1
+        download_version_files v2
+        download_version_files v3
+        download_version_files v4
+        download_version_files v2Pro
+        download_version_files v2ProPlus
+        ;;
+    *)
+        echo -e "${ERROR}Unknown version: $1"
+        exit 1
+        ;;
+    esac
+}
+
+echo -e "${INFO}Downloading Shared Inference Resources For Version ${MODEL_VERSION}..."
+download_shared_inference_files
+echo -e "${INFO}Downloading Version-Specific Inference Weights For ${MODEL_VERSION}..."
+download_version_files "$MODEL_VERSION"
+echo -e "${SUCCESS}Inference Pretrained Files Downloaded"
 
 if [ ! -d "GPT_SoVITS/text/G2PWModel" ]; then
     echo -e "${INFO}Downloading G2PWModel.."
@@ -278,21 +360,6 @@ if [ ! -d "GPT_SoVITS/text/G2PWModel" ]; then
 else
     echo -e "${INFO}G2PWModel Exists"
     echo -e "${INFO}Skip Downloading G2PWModel"
-fi
-
-if [ "$DOWNLOAD_UVR5" = "true" ]; then
-    if find -L "tools/uvr5/uvr5_weights" -mindepth 1 ! -name '.gitignore' | grep -q .; then
-        echo -e"${INFO}UVR5 Models Exists"
-        echo -e "${INFO}Skip Downloading UVR5 Models"
-    else
-        echo -e "${INFO}Downloading UVR5 Models..."
-        rm -rf uvr5_weights.zip
-        run_wget_quiet "$UVR5_URL"
-
-        unzip -q -o uvr5_weights.zip -d tools/uvr5
-        rm -rf uvr5_weights.zip
-        echo -e "${SUCCESS}UVR5 Models Downloaded"
-    fi
 fi
 
 if [ "$USE_CUDA" = true ] && [ "$WORKFLOW" = false ]; then
@@ -326,17 +393,17 @@ fi
 if [ "$USE_CUDA" = true ] && [ "$WORKFLOW" = false ]; then
     if [ "$CUDA" = 128 ]; then
         echo -e "${INFO}Installing PyTorch For CUDA 12.8..."
-        run_pip_quiet torch torchcodec --index-url "https://download.pytorch.org/whl/cu128"
+        run_pip_quiet torch --index-url "https://download.pytorch.org/whl/cu128"
     elif [ "$CUDA" = 126 ]; then
         echo -e "${INFO}Installing PyTorch For CUDA 12.6..."
-        run_pip_quiet torch torchcodec --index-url "https://download.pytorch.org/whl/cu126"
+        run_pip_quiet torch --index-url "https://download.pytorch.org/whl/cu126"
     fi
 elif [ "$USE_ROCM" = true ] && [ "$WORKFLOW" = false ]; then
     echo -e "${INFO}Installing PyTorch For ROCm 6.2..."
-    run_pip_quiet torch torchcodec --index-url "https://download.pytorch.org/whl/rocm6.2"
+    run_pip_quiet torch --index-url "https://download.pytorch.org/whl/rocm6.2"
 elif [ "$USE_CPU" = true ] && [ "$WORKFLOW" = false ]; then
     echo -e "${INFO}Installing PyTorch For CPU..."
-    run_pip_quiet torch torchcodec --index-url "https://download.pytorch.org/whl/cpu"
+    run_pip_quiet torch --index-url "https://download.pytorch.org/whl/cpu"
 elif [ "$WORKFLOW" = false ]; then
     echo -e "${ERROR}Unknown Err"
     exit 1
@@ -346,8 +413,6 @@ echo -e "${SUCCESS}PyTorch Installed"
 echo -e "${INFO}Installing Python Dependencies From requirements.txt..."
 
 hash -r
-
-run_pip_quiet -r extra-req.txt --no-deps
 
 run_pip_quiet -r requirements.txt
 
@@ -359,7 +424,7 @@ PYOPENJTALK_PREFIX=$(python -c "import os, pyopenjtalk; print(os.path.dirname(py
 echo -e "${INFO}Downloading NLTK Data..."
 rm -rf nltk_data.zip
 run_wget_quiet "$NLTK_URL" -O nltk_data.zip
-unzip -q -o nltk_data -d "$PY_PREFIX"
+unzip -q -o nltk_data.zip -d "$PY_PREFIX"
 rm -rf nltk_data.zip
 echo -e "${SUCCESS}NLTK Data Downloaded"
 

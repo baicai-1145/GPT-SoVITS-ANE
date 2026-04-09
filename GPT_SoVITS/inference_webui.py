@@ -6,8 +6,17 @@
 全部按英文识别
 全部按日文识别
 """
-import psutil
 import os
+import sys
+
+import psutil
+
+MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(MODULE_DIR)
+for path in (REPO_ROOT, MODULE_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 def set_high_priority():
     """把当前 Python 进程设为 HIGH_PRIORITY_CLASS"""
@@ -24,7 +33,6 @@ import json
 import logging
 import os
 import re
-import sys
 import traceback
 import warnings
 
@@ -95,6 +103,7 @@ import librosa
 import numpy as np
 from feature_extractor import cnhubert
 from transformers import AutoModelForMaskedLM, AutoTokenizer
+from tools.audio_utils import load_audio_tensor
 
 cnhubert.cnhubert_base_path = cnhubert_base_path
 
@@ -521,7 +530,7 @@ def get_spepc(hps, filename, dtype, device, is_v2pro=False):
     # audio = torch.FloatTensor(audio)
 
     sr1 = int(hps.data.sampling_rate)
-    audio, sr0 = torchaudio.load(filename)
+    audio, sr0 = load_audio_tensor(filename)
     if sr0 != sr1:
         audio = audio.to(device)
         if audio.shape[0] == 2:
@@ -925,7 +934,7 @@ def get_tts_wav(
             phoneme_ids0 = torch.LongTensor(phones1).to(device).unsqueeze(0)
             phoneme_ids1 = torch.LongTensor(phones2).to(device).unsqueeze(0)
             fea_ref, ge = vq_model.decode_encp(prompt.unsqueeze(0), phoneme_ids0, refer)
-            ref_audio, sr = torchaudio.load(ref_wav_path)
+            ref_audio, sr = load_audio_tensor(ref_wav_path)
             ref_audio = ref_audio.to(device).float()
             if ref_audio.shape[0] == 2:
                 ref_audio = ref_audio.mean(0).unsqueeze(0)

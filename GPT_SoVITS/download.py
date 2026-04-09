@@ -1,8 +1,12 @@
 import os
 import sys
 
-now_dir = os.getcwd()
-sys.path.insert(0, now_dir)
+MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(MODULE_DIR)
+for path in (REPO_ROOT, MODULE_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
 from text.g2pw import G2PWPinyin
 
 g2pw = G2PWPinyin(

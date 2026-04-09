@@ -1,7 +1,7 @@
 Param (
     [Parameter(Mandatory=$true)][ValidateSet("CU126", "CU128", "CPU")][string]$Device,
     [Parameter(Mandatory=$true)][ValidateSet("HF", "HF-Mirror", "ModelScope")][string]$Source,
-    [switch]$DownloadUVR5
+    [Parameter(Mandatory=$true)][ValidateSet("v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus", "all")][string]$Version
 )
 
 $global:ErrorActionPreference = 'Stop'
@@ -133,6 +133,93 @@ function Invoke-Unzip {
     Remove-Item $ZipPath -Force
 }
 
+function Download-RepoFileIfMissing {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RelativePath
+    )
+
+    $localPath = Join-Path "GPT_SoVITS" $RelativePath
+    $remoteUrl = "$RepoFileUrlPrefix/$RelativePath"
+
+    if (Test-Path $localPath -PathType Leaf) {
+        Write-Info "File Exists: $localPath"
+        return
+    }
+
+    $parent = Split-Path -Parent $localPath
+    if (-not (Test-Path $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    Write-Info "Downloading $RelativePath..."
+    Invoke-Download -Uri $remoteUrl -OutFile $localPath
+    Write-Success "Downloaded $RelativePath"
+}
+
+function Download-SharedInferenceFiles {
+    Download-RepoFileIfMissing "pretrained_models/chinese-hubert-base/config.json"
+    Download-RepoFileIfMissing "pretrained_models/chinese-hubert-base/preprocessor_config.json"
+    Download-RepoFileIfMissing "pretrained_models/chinese-hubert-base/pytorch_model.bin"
+
+    Download-RepoFileIfMissing "pretrained_models/chinese-roberta-wwm-ext-large/config.json"
+    Download-RepoFileIfMissing "pretrained_models/chinese-roberta-wwm-ext-large/pytorch_model.bin"
+    Download-RepoFileIfMissing "pretrained_models/chinese-roberta-wwm-ext-large/tokenizer.json"
+
+    Download-RepoFileIfMissing "pretrained_models/fast_langdetect/lid.176.bin"
+    Download-RepoFileIfMissing "pretrained_models/fast_langdetect/lid.176.ftz"
+}
+
+function Download-VersionFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SelectedVersion
+    )
+
+    switch ($SelectedVersion) {
+        "v1" {
+            Download-RepoFileIfMissing "pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt"
+            Download-RepoFileIfMissing "pretrained_models/s2G488k.pth"
+        }
+        "v2" {
+            Download-RepoFileIfMissing "pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"
+            Download-RepoFileIfMissing "pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"
+        }
+        "v3" {
+            Download-RepoFileIfMissing "pretrained_models/s1v3.ckpt"
+            Download-RepoFileIfMissing "pretrained_models/s2Gv3.pth"
+            Download-RepoFileIfMissing "pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/bigvgan_generator.pt"
+            Download-RepoFileIfMissing "pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/config.json"
+        }
+        "v4" {
+            Download-RepoFileIfMissing "pretrained_models/s1v3.ckpt"
+            Download-RepoFileIfMissing "pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
+            Download-RepoFileIfMissing "pretrained_models/gsv-v4-pretrained/vocoder.pth"
+        }
+        "v2Pro" {
+            Download-RepoFileIfMissing "pretrained_models/s1v3.ckpt"
+            Download-RepoFileIfMissing "pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt"
+            Download-RepoFileIfMissing "pretrained_models/v2Pro/s2Gv2Pro.pth"
+        }
+        "v2ProPlus" {
+            Download-RepoFileIfMissing "pretrained_models/s1v3.ckpt"
+            Download-RepoFileIfMissing "pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt"
+            Download-RepoFileIfMissing "pretrained_models/v2Pro/s2Gv2ProPlus.pth"
+        }
+        "all" {
+            Download-VersionFiles "v1"
+            Download-VersionFiles "v2"
+            Download-VersionFiles "v3"
+            Download-VersionFiles "v4"
+            Download-VersionFiles "v2Pro"
+            Download-VersionFiles "v2ProPlus"
+        }
+        default {
+            throw "Unknown version: $SelectedVersion"
+        }
+    }
+}
+
 chcp 65001
 Set-Location $PSScriptRoot
 
@@ -140,49 +227,40 @@ Write-Info "Installing FFmpeg & CMake..."
 Invoke-Conda  ffmpeg cmake
 Write-Success "FFmpeg & CMake Installed"
 
-$PretrainedURL  = ""
-$G2PWURL        = ""
-$UVR5URL        = ""
-$NLTKURL        = ""
-$OpenJTalkURL   = ""
+$RepoFileUrlPrefix = ""
+$G2PWURL          = ""
+$NLTKURL          = ""
+$OpenJTalkURL     = ""
 
 switch ($Source) {
     "HF" {
         Write-Info "Download Model From HuggingFace"
-        $PretrainedURL = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/pretrained_models.zip"
-        $G2PWURL       = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/G2PWModel.zip"
-        $UVR5URL       = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/uvr5_weights.zip"
-        $NLTKURL       = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/nltk_data.zip"
-        $OpenJTalkURL  = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/open_jtalk_dic_utf_8-1.11.tar.gz"
+        $RepoFileUrlPrefix = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main"
+        $G2PWURL           = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/G2PWModel.zip"
+        $NLTKURL           = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/nltk_data.zip"
+        $OpenJTalkURL      = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/open_jtalk_dic_utf_8-1.11.tar.gz"
     }
     "HF-Mirror" {
         Write-Info "Download Model From HuggingFace-Mirror"
-        $PretrainedURL = "https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/pretrained_models.zip"
-        $G2PWURL       = "https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/G2PWModel.zip"
-        $UVR5URL       = "https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/uvr5_weights.zip"
-        $NLTKURL       = "https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/nltk_data.zip"
-        $OpenJTalkURL  = "https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/open_jtalk_dic_utf_8-1.11.tar.gz"
+        $RepoFileUrlPrefix = "https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main"
+        $G2PWURL           = "https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/G2PWModel.zip"
+        $NLTKURL           = "https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/nltk_data.zip"
+        $OpenJTalkURL      = "https://hf-mirror.com/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/open_jtalk_dic_utf_8-1.11.tar.gz"
     }
     "ModelScope" {
         Write-Info "Download Model From ModelScope"
-        $PretrainedURL = "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/pretrained_models.zip"
-        $G2PWURL       = "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/G2PWModel.zip"
-        $UVR5URL       = "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/uvr5_weights.zip"
-        $NLTKURL       = "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/nltk_data.zip"
-        $OpenJTalkURL  = "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/open_jtalk_dic_utf_8-1.11.tar.gz"
+        $RepoFileUrlPrefix = "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master"
+        $G2PWURL           = "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/G2PWModel.zip"
+        $NLTKURL           = "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/nltk_data.zip"
+        $OpenJTalkURL      = "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/master/open_jtalk_dic_utf_8-1.11.tar.gz"
     }
 }
 
-if (-not (Test-Path "GPT_SoVITS/pretrained_models/sv")) {
-    Write-Info "Downloading Pretrained Models..."
-    Invoke-Download -Uri $PretrainedURL -OutFile "pretrained_models.zip"
-    Invoke-Unzip "pretrained_models.zip" "GPT_SoVITS"
-    Write-Success "Pretrained Models Downloaded"
-} else {
-    Write-Info "Pretrained Model Exists"
-    Write-Info "Skip Downloading Pretrained Models"
-}
-
+Write-Info "Downloading Shared Inference Resources For Version $Version..."
+Download-SharedInferenceFiles
+Write-Info "Downloading Version-Specific Inference Weights For $Version..."
+Download-VersionFiles $Version
+Write-Success "Inference Pretrained Files Downloaded"
 
 if (-not (Test-Path "GPT_SoVITS/text/G2PWModel")) {
     Write-Info "Downloading G2PWModel..."
@@ -194,36 +272,23 @@ if (-not (Test-Path "GPT_SoVITS/text/G2PWModel")) {
     Write-Info "Skip Downloading G2PWModel"
 }
 
-if ($DownloadUVR5) {
-    if (-not (Test-Path "tools/uvr5/uvr5_weights")) {
-        Write-Info "Downloading UVR5 Models..."
-        Invoke-Download -Uri $UVR5URL -OutFile "uvr5_weights.zip"
-        Invoke-Unzip "uvr5_weights.zip" "tools/uvr5"
-        Write-Success "UVR5 Models Downloaded"
-    } else {
-        Write-Info "UVR5 Models Exists"
-        Write-Info "Skip Downloading UVR5 Models"
-    }
-}
-
 switch ($Device) {
     "CU128" {
         Write-Info "Installing PyTorch For CUDA 12.8..."
-        Invoke-Pip torch torchcodec --index-url "https://download.pytorch.org/whl/cu128"
+        Invoke-Pip torch --index-url "https://download.pytorch.org/whl/cu128"
     }
     "CU126" {
         Write-Info "Installing PyTorch For CUDA 12.6..."
-        Invoke-Pip torch torchcodec --index-url "https://download.pytorch.org/whl/cu126"
+        Invoke-Pip torch --index-url "https://download.pytorch.org/whl/cu126"
     }
     "CPU" {
         Write-Info "Installing PyTorch For CPU..."
-        Invoke-Pip torch torchcodec --index-url "https://download.pytorch.org/whl/cpu"
+        Invoke-Pip torch --index-url "https://download.pytorch.org/whl/cpu"
     }
 }
 Write-Success "PyTorch Installed"
 
 Write-Info "Installing Python Dependencies From requirements.txt..."
-Invoke-Pip -r extra-req.txt --no-deps
 Invoke-Pip -r requirements.txt
 Write-Success "Python Dependencies Installed"
 

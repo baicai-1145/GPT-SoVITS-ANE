@@ -6,8 +6,17 @@
 全部按英文识别
 全部按日文识别
 """
-import psutil
 import os
+import sys
+
+import psutil
+
+MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(MODULE_DIR)
+for path in (REPO_ROOT, MODULE_DIR):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 def set_high_priority():
     """把当前 Python 进程设为 HIGH_PRIORITY_CLASS"""
@@ -25,13 +34,8 @@ import logging
 import os
 import random
 import re
-import sys
 
 import torch
-
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-sys.path.append("%s/GPT_SoVITS" % (now_dir))
 
 logging.getLogger("markdown_it").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
