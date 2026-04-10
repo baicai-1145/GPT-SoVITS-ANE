@@ -10,6 +10,7 @@ from text.tone_sandhi import ToneSandhi
 from text.zh_normalization.text_normlization import TextNormalizer
 
 normalizer = lambda x: cn2an.transform(x, "an2cn")
+text_normalizer = TextNormalizer()
 
 current_file_path = os.path.dirname(__file__)
 pinyin_to_symbol_map = {
@@ -322,8 +323,7 @@ def replace_consecutive_punctuation(text):
 
 def text_normalize(text):
     # https://github.com/PaddlePaddle/PaddleSpeech/tree/develop/paddlespeech/t2s/frontend/zh_normalization
-    tx = TextNormalizer()
-    sentences = tx.normalize(text)
+    sentences = text_normalizer.normalize(text)
     dest_text = ""
     for sentence in sentences:
         dest_text += replace_punctuation(sentence)

@@ -2,8 +2,11 @@
 
 from __future__ import print_function
 
+import importlib
 import re
-import inflect
+import sys
+import threading
+import types
 import unicodedata
 
 # 后缀计量单位替换表
@@ -22,9 +25,46 @@ measurement_map = {
     "°F": ["degree fahrenheit", "degrees fahrenheit"],
 }
 
+_inflect = None
+_INFLECT_LOCK = threading.Lock()
 
-# 识别 12,000 类型
-_inflect = inflect.engine()
+
+def _make_typeguard_stub():
+    stub = types.ModuleType("typeguard")
+
+    def typechecked(obj=None, **kwargs):
+        if obj is None:
+            def decorator(target):
+                return target
+
+            return decorator
+        return obj
+
+    stub.typechecked = typechecked
+    return stub
+
+
+def get_inflect():
+    global _inflect
+    if _inflect is not None:
+        return _inflect
+    with _INFLECT_LOCK:
+        if _inflect is not None:
+            return _inflect
+        original_typeguard = sys.modules.get("typeguard")
+        inserted_stub = False
+        if original_typeguard is None:
+            sys.modules["typeguard"] = _make_typeguard_stub()
+            inserted_stub = True
+        try:
+            inflect_module = importlib.import_module("inflect")
+            _inflect = inflect_module.engine()
+        finally:
+            if inserted_stub:
+                sys.modules.pop("typeguard", None)
+            elif original_typeguard is not None:
+                sys.modules["typeguard"] = original_typeguard
+    return _inflect
 
 # 转化数字序数词
 _ordinal_number_re = re.compile(r"\b([0-9]+)\. ")
@@ -68,7 +108,7 @@ def _convert_ordinal(m):
         output: "1st"
     然后在后面的 _expand_ordinal, 将其转化为 first 这类的
     """
-    ordinal = _inflect.ordinal(m.group(1))
+    ordinal = get_inflect().ordinal(m.group(1))
     return ordinal + ", "
 
 
@@ -89,8 +129,9 @@ def _expand_time(m):
     if hours > 12:
         hours -= 12
 
-    hour_word = _inflect.number_to_words(hours)
-    minute_word = _inflect.number_to_words(minutes) if minutes != 0 else ""
+    inflect_engine = get_inflect()
+    hour_word = inflect_engine.number_to_words(hours)
+    minute_word = inflect_engine.number_to_words(minutes) if minutes != 0 else ""
 
     if minutes == 0:
         return f"{hour_word} o'clock {period}"
@@ -203,7 +244,8 @@ def _expend_fraction(m):
     match = m.group(0)
     numerator, denominator = map(int, match.split("/"))
 
-    numerator_part = _inflect.number_to_words(numerator)
+    inflect_engine = get_inflect()
+    numerator_part = inflect_engine.number_to_words(numerator)
     if denominator == 2:
         if numerator == 1:
             denominator_part = "half"
@@ -212,7 +254,7 @@ def _expend_fraction(m):
     elif denominator == 1:
         return f"{numerator_part}"
     else:
-        denominator_part = _inflect.ordinal(_inflect.number_to_words(denominator))
+        denominator_part = inflect_engine.ordinal(inflect_engine.number_to_words(denominator))
         if numerator > 1:
             denominator_part += "s"
 
@@ -220,22 +262,23 @@ def _expend_fraction(m):
 
 
 def _expand_ordinal(m):
-    return _inflect.number_to_words(m.group(0))
+    return get_inflect().number_to_words(m.group(0))
 
 
 def _expand_number(m):
+    inflect_engine = get_inflect()
     num = int(m.group(0))
     if num > 1000 and num < 3000:
         if num == 2000:
             return "two thousand"
         elif num > 2000 and num < 2010:
-            return "two thousand " + _inflect.number_to_words(num % 100)
+            return "two thousand " + inflect_engine.number_to_words(num % 100)
         elif num % 100 == 0:
-            return _inflect.number_to_words(num // 100) + " hundred"
+            return inflect_engine.number_to_words(num // 100) + " hundred"
         else:
-            return _inflect.number_to_words(num, andword="", zero="oh", group=2).replace(", ", " ")
+            return inflect_engine.number_to_words(num, andword="", zero="oh", group=2).replace(", ", " ")
     else:
-        return _inflect.number_to_words(num, andword="")
+        return inflect_engine.number_to_words(num, andword="")
 
 
 # 加减乘除
@@ -309,7 +352,7 @@ def normalize(text):
     )  # Strip accents
 
     text = re.sub("%", " percent", text)
-    text = re.sub("[^ A-Za-z'.,?!\-]", "", text)
+    text = re.sub(r"[^ A-Za-z'.,?!-]", "", text)
     text = re.sub(r"(?i)i\.e\.", "that is", text)
     text = re.sub(r"(?i)e\.g\.", "for example", text)
     # 增加纯大写单词拆分

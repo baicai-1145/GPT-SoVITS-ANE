@@ -8,6 +8,7 @@ from text.symbols import punctuation
 from text.zh_normalization.text_normlization import TextNormalizer
 
 normalizer = lambda x: cn2an.transform(x, "an2cn")
+text_normalizer = TextNormalizer()
 
 INITIALS = [
     "aa",
@@ -104,8 +105,7 @@ def replace_punctuation(text):
 
 
 def text_normalize(text):
-    tx = TextNormalizer()
-    sentences = tx.normalize(text)
+    sentences = text_normalizer.normalize(text)
     dest_text = ""
     for sentence in sentences:
         dest_text += replace_punctuation(sentence)

@@ -1,12 +1,96 @@
 # reference: https://github.com/ORI-Muchim/MB-iSTFT-VITS-Korean/blob/main/text/korean.py
 
 import re
+import sys
+import threading
+import types
 from jamo import h2j, j2hcj
 import ko_pron
-from g2pk2 import G2p
 
 import importlib
+import importlib.util
 import os
+
+
+class _LazyCmuDict:
+    def __init__(self):
+        self._cmu = None
+        self._lock = threading.Lock()
+
+    def _ensure(self):
+        if self._cmu is not None:
+            return self._cmu
+        with self._lock:
+            if self._cmu is not None:
+                return self._cmu
+            old_nltk = sys.modules.pop("nltk", None)
+            old_corpus = sys.modules.pop("nltk.corpus", None)
+            old_cmudict = sys.modules.pop("nltk.corpus.cmudict", None)
+            try:
+                nltk = importlib.import_module("nltk")
+                from nltk.corpus import cmudict
+
+                try:
+                    nltk.data.find("corpora/cmudict.zip")
+                except LookupError:
+                    nltk.download("cmudict")
+                self._cmu = cmudict.dict()
+            finally:
+                if old_nltk is not None:
+                    sys.modules["nltk"] = old_nltk
+                if old_corpus is not None:
+                    sys.modules["nltk.corpus"] = old_corpus
+                if old_cmudict is not None:
+                    sys.modules["nltk.corpus.cmudict"] = old_cmudict
+            return self._cmu
+
+    def __contains__(self, key):
+        return key in self._ensure()
+
+    def __getitem__(self, key):
+        return self._ensure()[key]
+
+    def get(self, key, default=None):
+        return self._ensure().get(key, default)
+
+
+def _install_lazy_nltk_stub():
+    if "nltk" in sys.modules:
+        return None
+    nltk_stub = types.ModuleType("nltk")
+
+    class _Data:
+        @staticmethod
+        def find(path):
+            return path
+
+    nltk_stub.data = _Data()
+    nltk_stub.download = lambda name: True
+
+    corpus_stub = types.ModuleType("nltk.corpus")
+    cmudict_stub = types.ModuleType("nltk.corpus.cmudict")
+    cmudict_stub.dict = lambda: _LazyCmuDict()
+    corpus_stub.cmudict = cmudict_stub
+    nltk_stub.corpus = corpus_stub
+
+    sys.modules["nltk"] = nltk_stub
+    sys.modules["nltk.corpus"] = corpus_stub
+    sys.modules["nltk.corpus.cmudict"] = cmudict_stub
+    return ("nltk", "nltk.corpus", "nltk.corpus.cmudict")
+
+
+def _cleanup_lazy_nltk_stub(installed_names):
+    if not installed_names:
+        return
+    for name in installed_names:
+        sys.modules.pop(name, None)
+
+
+_stubbed_nltk_modules = _install_lazy_nltk_stub()
+try:
+    from g2pk2 import G2p
+finally:
+    _cleanup_lazy_nltk_stub(_stubbed_nltk_modules)
 
 # 防止win下无法读取模型
 if os.name == "nt":

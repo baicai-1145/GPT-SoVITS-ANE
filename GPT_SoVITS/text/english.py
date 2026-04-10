@@ -1,8 +1,8 @@
 import pickle
+import importlib.util
 import os
 import re
-import wordsegment
-from g2p_en import G2p
+import numpy as np
 
 from text.symbols import punctuation
 
@@ -10,10 +10,6 @@ from text.symbols2 import symbols
 
 from builtins import str as unicode
 from text.en_normalization.expend import normalize
-from nltk.tokenize import TweetTokenizer
-
-word_tokenize = TweetTokenizer().tokenize
-from nltk import pos_tag
 
 current_file_path = os.path.dirname(__file__)
 CMU_DICT_PATH = os.path.join(current_file_path, "cmudict.rep")
@@ -21,6 +17,14 @@ CMU_DICT_FAST_PATH = os.path.join(current_file_path, "cmudict-fast.rep")
 CMU_DICT_HOT_PATH = os.path.join(current_file_path, "engdict-hot.rep")
 CACHE_PATH = os.path.join(current_file_path, "engdict_cache.pickle")
 NAMECACHE_PATH = os.path.join(current_file_path, "namedict_cache.pickle")
+G2P_EN_SPEC = importlib.util.find_spec("g2p_en")
+if G2P_EN_SPEC is None or not G2P_EN_SPEC.submodule_search_locations:
+    raise ImportError("g2p_en package data files not found")
+G2P_EN_DIR = G2P_EN_SPEC.submodule_search_locations[0]
+G2P_CHECKPOINT_PATH = os.path.join(G2P_EN_DIR, "checkpoint20.npz")
+G2P_HOMOGRAPHS_PATH = os.path.join(G2P_EN_DIR, "homographs.en")
+_wordsegment = None
+_pos_tag = None
 
 
 # 适配中文及 g2p_en 标点
@@ -108,6 +112,41 @@ arpa = {
 }
 
 
+def construct_homograph_dictionary():
+    homograph2features = {}
+    with open(G2P_HOMOGRAPHS_PATH, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            headword, pron1, pron2, pos1 = line.split("|")
+            homograph2features[headword.lower()] = (pron1.split(), pron2.split(), pos1)
+    return homograph2features
+
+
+def ensure_wordsegment():
+    global _wordsegment
+    if _wordsegment is None:
+        import wordsegment as wordsegment_module
+
+        wordsegment_module.load()
+        _wordsegment = wordsegment_module
+    return _wordsegment
+
+
+def ensure_pos_tag():
+    global _pos_tag
+    if _pos_tag is None:
+        from nltk import pos_tag as nltk_pos_tag
+
+        _pos_tag = nltk_pos_tag
+    return _pos_tag
+
+
+def simple_word_tokenize(text: str):
+    return re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?|[.,?!\-]", text)
+
+
 def replace_phs(phs):
     rep_map = {"'": "-"}
     phs_new = []
@@ -123,7 +162,7 @@ def replace_phs(phs):
 
 def replace_consecutive_punctuation(text):
     punctuations = "".join(re.escape(p) for p in punctuation)
-    pattern = f"([{punctuations}\s])([{punctuations}])+"
+    pattern = f"([{punctuations}\\s])([{punctuations}])+"
     result = re.sub(pattern, r"\1", text)
     return result
 
@@ -245,15 +284,26 @@ def text_normalize(text):
     return text
 
 
-class en_G2p(G2p):
+class en_G2p:
     def __init__(self):
-        super().__init__()
-        # 分词初始化
-        wordsegment.load()
+        self.graphemes = ["<pad>", "<unk>", "</s>"] + list("abcdefghijklmnopqrstuvwxyz")
+        self.phonemes = ["<pad>", "<unk>", "<s>", "</s>"] + ['AA0', 'AA1', 'AA2', 'AE0', 'AE1', 'AE2', 'AH0', 'AH1', 'AH2', 'AO0',
+                                                             'AO1', 'AO2', 'AW0', 'AW1', 'AW2', 'AY0', 'AY1', 'AY2', 'B', 'CH', 'D', 'DH',
+                                                             'EH0', 'EH1', 'EH2', 'ER0', 'ER1', 'ER2', 'EY0', 'EY1',
+                                                             'EY2', 'F', 'G', 'HH',
+                                                             'IH0', 'IH1', 'IH2', 'IY0', 'IY1', 'IY2', 'JH', 'K', 'L',
+                                                             'M', 'N', 'NG', 'OW0', 'OW1',
+                                                             'OW2', 'OY0', 'OY1', 'OY2', 'P', 'R', 'S', 'SH', 'T', 'TH',
+                                                             'UH0', 'UH1', 'UH2', 'UW',
+                                                             'UW0', 'UW1', 'UW2', 'V', 'W', 'Y', 'Z', 'ZH']
+        self.g2idx = {g: idx for idx, g in enumerate(self.graphemes)}
+        self.idx2p = {idx: p for idx, p in enumerate(self.phonemes)}
+        self.predictor_loaded = False
 
         # 扩展过时字典, 添加姓名字典
         self.cmu = get_dict()
         self.namedict = get_namedict()
+        self.homograph2features = construct_homograph_dictionary()
 
         # 剔除读音错误的几个缩写
         for word in ["AE", "AI", "AR", "IOS", "HUD", "OS"]:
@@ -267,10 +317,100 @@ class en_G2p(G2p):
             "JJ",
         )
 
+    def _needs_pos_tag(self, words):
+        for original_word in words:
+            word = original_word.lower()
+            if re.search("[a-z]", word) is None:
+                continue
+            if word in self.homograph2features:
+                return True
+        return False
+
+    def _ensure_predictor_loaded(self):
+        if self.predictor_loaded:
+            return
+        variables = np.load(G2P_CHECKPOINT_PATH)
+        self.enc_emb = variables["enc_emb"]
+        self.enc_w_ih = variables["enc_w_ih"]
+        self.enc_w_hh = variables["enc_w_hh"]
+        self.enc_b_ih = variables["enc_b_ih"]
+        self.enc_b_hh = variables["enc_b_hh"]
+        self.dec_emb = variables["dec_emb"]
+        self.dec_w_ih = variables["dec_w_ih"]
+        self.dec_w_hh = variables["dec_w_hh"]
+        self.dec_b_ih = variables["dec_b_ih"]
+        self.dec_b_hh = variables["dec_b_hh"]
+        self.fc_w = variables["fc_w"]
+        self.fc_b = variables["fc_b"]
+        self.predictor_loaded = True
+
+    def sigmoid(self, x):
+        return 1 / (1 + np.exp(-x))
+
+    def grucell(self, x, h, w_ih, w_hh, b_ih, b_hh):
+        rzn_ih = np.matmul(x, w_ih.T) + b_ih
+        rzn_hh = np.matmul(h, w_hh.T) + b_hh
+
+        rz_ih, n_ih = rzn_ih[:, :rzn_ih.shape[-1] * 2 // 3], rzn_ih[:, rzn_ih.shape[-1] * 2 // 3:]
+        rz_hh, n_hh = rzn_hh[:, :rzn_hh.shape[-1] * 2 // 3], rzn_hh[:, rzn_hh.shape[-1] * 2 // 3:]
+
+        rz = self.sigmoid(rz_ih + rz_hh)
+        r, z = np.split(rz, 2, -1)
+
+        n = np.tanh(n_ih + r * n_hh)
+        h = (1 - z) * n + z * h
+
+        return h
+
+    def gru(self, x, steps, w_ih, w_hh, b_ih, b_hh, h0=None):
+        if h0 is None:
+            h0 = np.zeros((x.shape[0], w_hh.shape[1]), np.float32)
+        h = h0
+        outputs = np.zeros((x.shape[0], steps, w_hh.shape[1]), np.float32)
+        for t in range(steps):
+            h = self.grucell(x[:, t, :], h, w_ih, w_hh, b_ih, b_hh)
+            outputs[:, t, ::] = h
+        return outputs
+
+    def encode(self, word):
+        chars = list(word) + ["</s>"]
+        x = [self.g2idx.get(char, self.g2idx["<unk>"]) for char in chars]
+        x = np.take(self.enc_emb, np.expand_dims(x, 0), axis=0)
+        return x
+
+    def predict(self, word):
+        self._ensure_predictor_loaded()
+        enc = self.encode(word)
+        enc = self.gru(
+            enc,
+            len(word) + 1,
+            self.enc_w_ih,
+            self.enc_w_hh,
+            self.enc_b_ih,
+            self.enc_b_hh,
+            h0=np.zeros((1, self.enc_w_hh.shape[-1]), np.float32),
+        )
+        last_hidden = enc[:, -1, :]
+
+        dec = np.take(self.dec_emb, [2], axis=0)
+        h = last_hidden
+
+        preds = []
+        for _ in range(20):
+            h = self.grucell(dec, h, self.dec_w_ih, self.dec_w_hh, self.dec_b_ih, self.dec_b_hh)
+            logits = np.matmul(h, self.fc_w.T) + self.fc_b
+            pred = logits.argmax()
+            if pred == 3:
+                break
+            preds.append(pred)
+            dec = np.take(self.dec_emb, [pred], axis=0)
+
+        return [self.idx2p.get(idx, "<unk>") for idx in preds]
+
     def __call__(self, text):
         # tokenization
-        words = word_tokenize(text)
-        tokens = pos_tag(words)  # tuples of (word, tag)
+        words = simple_word_tokenize(text)
+        tokens = ensure_pos_tag()(words) if self._needs_pos_tag(words) else [(word, "") for word in words]
 
         # steps
         prons = []
@@ -347,7 +487,7 @@ class en_G2p(G2p):
             return phones
 
         # 尝试进行分词，应对复合词
-        comps = wordsegment.segment(word.lower())
+        comps = ensure_wordsegment().segment(word.lower())
 
         # 无法分词的送回去预测
         if len(comps) == 1:
