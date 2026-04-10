@@ -477,6 +477,15 @@ class TTS:
             "bert_features": None,
             "norm_text": None,
             "aux_ref_audio_paths": [],
+            "runtime": {
+                "ref_key": None,
+                "refer_audio_spec": None,
+                "sv_emb": None,
+                "prompt_key": None,
+                "prompt_semantic_tokens": None,
+                "prompt_phones": None,
+                "vocoder_refer_audio_spec": None,
+            },
         }
 
         self.stop_flag: bool = False
@@ -743,6 +752,7 @@ class TTS:
                 self.cnhuhbert_model = self.cnhuhbert_model.float()
             if self.vocoder is not None:
                 self.vocoder = self.vocoder.float()
+        self._invalidate_prompt_runtime_cache()
 
     def set_device(self, device: torch.device, save: bool = True):
         """
@@ -765,6 +775,7 @@ class TTS:
             self.vocoder = self.vocoder.to(device)
         if self.sr_model is not None:
             self.sr_model = self.sr_model.to(device)
+        self._invalidate_prompt_runtime_cache()
 
     def set_ref_audio(self, ref_audio_path: str):
         """
@@ -776,9 +787,92 @@ class TTS:
         self._set_prompt_semantic(ref_audio_path)
         self._set_ref_spec(ref_audio_path)
         self._set_ref_audio_path(ref_audio_path)
+        self._invalidate_prompt_runtime_cache()
 
     def _set_ref_audio_path(self, ref_audio_path):
         self.prompt_cache["ref_audio_path"] = ref_audio_path
+
+    def _invalidate_prompt_runtime_cache(self):
+        self.prompt_cache["runtime"] = {
+            "ref_key": None,
+            "refer_audio_spec": None,
+            "sv_emb": None,
+            "prompt_key": None,
+            "prompt_semantic_tokens": None,
+            "prompt_phones": None,
+            "vocoder_refer_audio_spec": None,
+        }
+
+    def _get_prompt_runtime_cache(self) -> dict:
+        runtime = self.prompt_cache.get("runtime")
+        if runtime is None:
+            self._invalidate_prompt_runtime_cache()
+            runtime = self.prompt_cache["runtime"]
+        return runtime
+
+    def _get_ref_runtime_key(self) -> tuple:
+        return (
+            str(self.configs.device),
+            str(self.precision),
+            self.prompt_cache.get("ref_audio_path"),
+            tuple(self.prompt_cache.get("aux_ref_audio_paths", [])),
+            len(self.prompt_cache.get("refer_spec", [])),
+            self.is_v2pro,
+        )
+
+    def _get_vocoder_prompt_key(self) -> tuple:
+        return (
+            str(self.configs.device),
+            str(self.precision),
+            self.prompt_cache.get("ref_audio_path"),
+            tuple(self.prompt_cache.get("aux_ref_audio_paths", [])),
+            self.prompt_cache.get("prompt_text"),
+        )
+
+    def _get_runtime_refer_audio_spec_and_sv_emb(self):
+        runtime = self._get_prompt_runtime_cache()
+        ref_key = self._get_ref_runtime_key()
+        refer_audio_spec = runtime.get("refer_audio_spec")
+        sv_emb = runtime.get("sv_emb")
+        if runtime.get("ref_key") != ref_key or refer_audio_spec is None or (self.is_v2pro and sv_emb is None):
+            refer_audio_spec = []
+            sv_emb = [] if self.is_v2pro else None
+            for spec, audio_tensor in self.prompt_cache["refer_spec"]:
+                refer_audio_spec.append(spec.to(dtype=self.precision, device=self.configs.device))
+                if self.is_v2pro:
+                    sv_emb.append(self.sv_model.compute_embedding3(audio_tensor))
+            runtime["ref_key"] = ref_key
+            runtime["refer_audio_spec"] = refer_audio_spec
+            runtime["sv_emb"] = sv_emb
+            runtime["prompt_key"] = None
+            runtime["prompt_semantic_tokens"] = None
+            runtime["prompt_phones"] = None
+            runtime["vocoder_refer_audio_spec"] = None
+        return refer_audio_spec, sv_emb
+
+    def _get_runtime_vocoder_prompt_inputs(self):
+        runtime = self._get_prompt_runtime_cache()
+        prompt_key = self._get_vocoder_prompt_key()
+        refer_audio_spec, _ = self._get_runtime_refer_audio_spec_and_sv_emb()
+        if (
+            runtime.get("prompt_key") != prompt_key
+            or runtime.get("prompt_semantic_tokens") is None
+            or runtime.get("prompt_phones") is None
+            or runtime.get("vocoder_refer_audio_spec") is None
+        ):
+            runtime["prompt_semantic_tokens"] = (
+                self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
+            )
+            runtime["prompt_phones"] = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(
+                self.configs.device
+            )
+            runtime["vocoder_refer_audio_spec"] = refer_audio_spec[0]
+            runtime["prompt_key"] = prompt_key
+        return (
+            runtime["prompt_semantic_tokens"],
+            runtime["prompt_phones"],
+            runtime["vocoder_refer_audio_spec"],
+        )
 
     def _set_ref_spec(self, ref_audio_path):
         spec_audio = self._get_ref_spec(ref_audio_path)
@@ -1169,6 +1263,7 @@ class TTS:
                     print(i18n("音频文件不存在，跳过："), path)
                     continue
                 self.prompt_cache["refer_spec"].append(self._get_ref_spec(path))
+            self._invalidate_prompt_runtime_cache()
 
         if not no_prompt_text:
             prompt_text = prompt_text.strip("\n")
@@ -1184,6 +1279,7 @@ class TTS:
                 self.prompt_cache["phones"] = phones
                 self.prompt_cache["bert_features"] = bert_features
                 self.prompt_cache["norm_text"] = norm_text
+                self._invalidate_prompt_runtime_cache()
 
         ###### text preprocessing ########
         t1 = time.perf_counter()
@@ -1254,6 +1350,7 @@ class TTS:
             audio = []
             is_first_package = True
             output_sr = self.configs.sampling_rate if not self.configs.use_vocoder else self.vocoder_configs["sr"]
+            refer_audio_spec, sv_emb = self._get_runtime_refer_audio_spec_and_sv_emb()
             for item in data:
                 t3 = time.perf_counter()
                 c3 = get_process_cpu_time_sec() if BENCH_CPU_ENABLED else 0.0
@@ -1278,15 +1375,6 @@ class TTS:
                     prompt = (
                         self.prompt_cache["prompt_semantic"].expand(len(all_phoneme_ids), -1).to(self.configs.device)
                     )
-
-                refer_audio_spec = []
-                
-                sv_emb = [] if self.is_v2pro else None
-                for spec, audio_tensor in self.prompt_cache["refer_spec"]:
-                    spec = spec.to(dtype=self.precision, device=self.configs.device)
-                    refer_audio_spec.append(spec)
-                    if self.is_v2pro:
-                        sv_emb.append(self.sv_model.compute_embedding3(audio_tensor))
 
                 if not streaming_mode:
                     print(f"############ {i18n('预测语义Token')} ############")
@@ -1678,12 +1766,7 @@ class TTS:
     def using_vocoder_synthesis(
         self, semantic_tokens: torch.Tensor, phones: torch.Tensor, speed: float = 1.0, sample_steps: int = 32
     ):
-        prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
-        prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
-        raw_entry = self.prompt_cache["refer_spec"][0]
-        if isinstance(raw_entry, tuple):
-            raw_entry = raw_entry[0]
-        refer_audio_spec = raw_entry.to(dtype=self.precision, device=self.configs.device)
+        prompt_semantic_tokens, prompt_phones, refer_audio_spec = self._get_runtime_vocoder_prompt_inputs()
 
         fea_ref, ge = self.vits_model.decode_encp(prompt_semantic_tokens, prompt_phones, refer_audio_spec)
         ref_audio: torch.Tensor = self.prompt_cache["raw_audio"]
@@ -1748,12 +1831,7 @@ class TTS:
         speed: float = 1.0,
         sample_steps: int = 32,
     ) -> List[torch.Tensor]:
-        prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
-        prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
-        raw_entry = self.prompt_cache["refer_spec"][0]
-        if isinstance(raw_entry, tuple):
-            raw_entry = raw_entry[0]
-        refer_audio_spec = raw_entry.to(dtype=self.precision, device=self.configs.device)
+        prompt_semantic_tokens, prompt_phones, refer_audio_spec = self._get_runtime_vocoder_prompt_inputs()
 
         fea_ref, ge = self.vits_model.decode_encp(prompt_semantic_tokens, prompt_phones, refer_audio_spec)
         ref_audio: torch.Tensor = self.prompt_cache["raw_audio"]
