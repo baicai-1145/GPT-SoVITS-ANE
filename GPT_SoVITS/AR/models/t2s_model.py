@@ -33,6 +33,21 @@ default_config = {
     "EOS": 1024,
 }
 
+MAX_AR_DECODE_STEPS = 1500
+
+
+def _alloc_token_buffer(initial_tokens: torch.Tensor, max_decode_steps: int) -> torch.Tensor:
+    batch_size = initial_tokens.shape[0]
+    prefix_len = initial_tokens.shape[1]
+    buffer = torch.empty(
+        (batch_size, prefix_len + max_decode_steps),
+        dtype=initial_tokens.dtype,
+        device=initial_tokens.device,
+    )
+    if prefix_len > 0:
+        buffer[:, :prefix_len] = initial_tokens
+    return buffer
+
 
 # @torch.jit.script ## 使用的话首次推理会非常慢，而且推理速度不稳定
 # Efficient implementation equivalent to the following:
@@ -698,7 +713,9 @@ class Text2SemanticDecoder(nn.Module):
         y_list = [None] * y.shape[0]
         batch_idx_map = list(range(y.shape[0]))
         idx_list = [None] * y.shape[0]
-        for idx in tqdm(range(1500)):
+        y_buffer = _alloc_token_buffer(y, MAX_AR_DECODE_STEPS)
+        curr_y_len = prefix_len
+        for idx in tqdm(range(MAX_AR_DECODE_STEPS)):
             if idx == 0:
                 xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, attn_mask, None)
             else:
@@ -713,11 +730,12 @@ class Text2SemanticDecoder(nn.Module):
             if idx < 11:  ###至少预测出10个token不然不给停止（0.4s）
                 logits = logits[:, :-1] 
 
+            y = y_buffer[:, :curr_y_len]
             samples = sample(
                 logits, y, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature
             )[0]
-
-            y = torch.concat([y, samples], dim=1)
+            y_buffer[:, curr_y_len : curr_y_len + 1] = samples
+            curr_y_len += 1
 
             ####### 移除batch中已经生成完毕的序列,进一步优化计算量
             tokens = torch.argmax(logits, dim=-1)
@@ -732,40 +750,42 @@ class Text2SemanticDecoder(nn.Module):
                 for i in removed_idx_of_batch_for_y:
                     batch_index = batch_idx_map[i]
                     idx_list[batch_index] = idx
-                    y_list[batch_index] = y[i, :-1]
+                    y_list[batch_index] = y_buffer[i, : curr_y_len - 1].clone()
 
                 batch_idx_map = [batch_idx_map[i] for i in reserved_idx_of_batch_for_y.tolist()]
 
             # 只保留batch中未生成完毕的序列
             if reserved_idx_of_batch_for_y is not None:
                 # index = torch.LongTensor(batch_idx_map).to(y.device)
-                y = torch.index_select(y, dim=0, index=reserved_idx_of_batch_for_y)
+                y_buffer = torch.index_select(y_buffer, dim=0, index=reserved_idx_of_batch_for_y)
                 attn_mask = torch.index_select(attn_mask, dim=0, index=reserved_idx_of_batch_for_y)
+                samples = torch.index_select(samples, dim=0, index=reserved_idx_of_batch_for_y)
                 if k_cache is not None:
                     for i in range(len(k_cache)):
                         k_cache[i] = torch.index_select(k_cache[i], dim=0, index=reserved_idx_of_batch_for_y)
                         v_cache[i] = torch.index_select(v_cache[i], dim=0, index=reserved_idx_of_batch_for_y)
 
-            if (early_stop_num != -1 and (y.shape[1] - prefix_len) > early_stop_num) or idx == 1499:
+            if (early_stop_num != -1 and (curr_y_len - prefix_len) > early_stop_num) or idx == MAX_AR_DECODE_STEPS - 1:
                 print("use early stop num:", early_stop_num)
                 stop = True
                 for i, batch_index in enumerate(batch_idx_map):
                     batch_index = batch_idx_map[i]
                     idx_list[batch_index] = idx
-                    y_list[batch_index] = y[i, :-1]
+                    y_list[batch_index] = y_buffer[i, : curr_y_len - 1].clone()
 
             if None not in idx_list:
                 stop = True
 
             if stop:
-                if y.shape[1] == 0:
-                    y = torch.concat([y, torch.zeros_like(samples)], dim=1)
+                if curr_y_len == 0:
+                    y_buffer[:, 0:1] = torch.zeros_like(samples)
+                    curr_y_len = 1
                     print("bad zero prediction")
-                print(f"T2S Decoding EOS [{prefix_len} -> {y.shape[1]}]")
+                print(f"T2S Decoding EOS [{prefix_len} -> {curr_y_len}]")
                 break
 
             ####################### update next step ###################################
-            y_emb = self.ar_audio_embedding(y[:, -1:])
+            y_emb = self.ar_audio_embedding(samples)
             xy_pos = y_emb * self.ar_audio_position.x_scale + self.ar_audio_position.alpha * self.ar_audio_position.pe[
                 :, y_len + idx
             ].to(dtype=y_emb.dtype, device=y_emb.device)
@@ -773,7 +793,7 @@ class Text2SemanticDecoder(nn.Module):
         if None in idx_list:
             for i in range(x.shape[0]):
                 if idx_list[i] is None:
-                    idx_list[i] = 1500 - 1  ###如果没有生成到EOS，就用最大长度代替
+                    idx_list[i] = MAX_AR_DECODE_STEPS - 1  ###如果没有生成到EOS，就用最大长度代替
 
         if ref_free:
             return y_list, [0] * x.shape[0]
@@ -886,7 +906,9 @@ class Text2SemanticDecoder(nn.Module):
 
         token_counter = 0
         curr_ptr = prefix_len
-        for idx in tqdm(range(1500)):
+        y_buffer = _alloc_token_buffer(y, MAX_AR_DECODE_STEPS)
+        curr_y_len = prefix_len
+        for idx in tqdm(range(MAX_AR_DECODE_STEPS)):
             token_counter+=1
             if xy_attn_mask is not None:
                 xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, xy_attn_mask, None)
@@ -900,56 +922,61 @@ class Text2SemanticDecoder(nn.Module):
             if idx < 11:  ###至少预测出10个token不然不给停止（0.4s）
                 logits = logits[:, :-1]
 
+            y = y_buffer[:, :curr_y_len]
             samples = sample(
                 logits, y, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature
             )[0]
+            y_buffer[:, curr_y_len : curr_y_len + 1] = samples
+            curr_y_len += 1
 
-            y = torch.concat([y, samples], dim=1)
-
-            if early_stop_num != -1 and (y.shape[1] - prefix_len) > early_stop_num:
+            if early_stop_num != -1 and (curr_y_len - prefix_len) > early_stop_num:
                 print("use early stop num:", early_stop_num)
                 stop = True
 
             if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:
                 stop = True
-                y=y[:, :-1]
+                curr_y_len -= 1
                 token_counter -= 1
 
-            if idx == 1499:
+            if idx == MAX_AR_DECODE_STEPS - 1:
                 stop = True
 
             if stop:
-                if y.shape[1] == 0:
-                    y = torch.concat([y, torch.zeros_like(samples)], dim=1)
+                if curr_y_len == 0:
+                    y_buffer[:, 0:1] = torch.zeros_like(samples)
+                    curr_y_len = 1
                     print("bad zero prediction")
                 # print(f"T2S Decoding EOS [{prefix_len} -> {y.shape[1]}]")
                 if streaming_mode:
-                    yield y[:, curr_ptr:] if curr_ptr<y.shape[1] else None, True
+                    final_y = y_buffer[:, :curr_y_len]
+                    yield final_y[:, curr_ptr:] if curr_ptr < final_y.shape[1] else None, True
                 break
 
 
             if streaming_mode and (mute_emb_sim_matrix is not None) and (token_counter >= chunk_length+check_token_num):
-                score = mute_emb_sim_matrix[y[0, curr_ptr:]] - chunk_split_thershold
+                active_y = y_buffer[:, :curr_y_len]
+                score = mute_emb_sim_matrix[active_y[0, curr_ptr:]] - chunk_split_thershold
                 score[score<0]=-1
                 score[:-1]=score[:-1]+score[1:] ##考虑连续两个token
                 argmax_idx = score.argmax()
 
                 if score[argmax_idx]>=0 and argmax_idx+1>=chunk_length: 
                     print(f"\n\ncurr_ptr:{curr_ptr}")
-                    yield y[:, curr_ptr:], False
+                    yield active_y[:, curr_ptr:], False
                     token_counter -= argmax_idx+1
                     curr_ptr += argmax_idx+1
 
 
             elif streaming_mode and (mute_emb_sim_matrix is None) and (token_counter >= chunk_length):
-                yield y[:, -token_counter:], False
+                active_y = y_buffer[:, :curr_y_len]
+                yield active_y[:, -token_counter:], False
                 curr_ptr+=token_counter
                 token_counter = 0
                 
 
 
             ####################### update next step ###################################
-            y_emb = self.ar_audio_embedding(y[:, -1:])
+            y_emb = self.ar_audio_embedding(samples)
             xy_pos = y_emb * self.ar_audio_position.x_scale + self.ar_audio_position.alpha * self.ar_audio_position.pe[
                 :, y_len + idx
             ].to(dtype=y_emb.dtype, device=y_emb.device)
@@ -957,6 +984,7 @@ class Text2SemanticDecoder(nn.Module):
 
 
         if not streaming_mode:
+            y = y_buffer[:, :curr_y_len]
             if ref_free:
                 yield y, 0
             yield y, idx
