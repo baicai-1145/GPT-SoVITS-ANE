@@ -83,9 +83,18 @@ def clean_text_with_phone_units(text, language, version=None):
 
     phone_units = None
     if language == "zh" or language == "yue":
-        phones, word2ph = language_module.g2p(norm_text)
-        assert len(phones) == sum(word2ph)
-        assert len(norm_text) == len(word2ph)
+        if hasattr(language_module, "g2p_with_phone_units"):
+            g2p_result = language_module.g2p_with_phone_units(norm_text)
+            if len(g2p_result) == 3:
+                phones, word2ph, phone_units = g2p_result
+            else:
+                phones, phone_units = g2p_result
+                word2ph = None
+        else:
+            phones, word2ph = language_module.g2p(norm_text)
+            phone_units = None
+            assert len(phones) == sum(word2ph)
+            assert len(norm_text) == len(word2ph)
     elif language == "en":
         if hasattr(language_module, "g2p_with_phone_units"):
             phones, phone_units = language_module.g2p_with_phone_units(norm_text)
@@ -105,9 +114,7 @@ def clean_text_with_phone_units(text, language, version=None):
         word2ph = None
 
     phones = ["UNK" if ph not in symbols else ph for ph in phones]
-    if word2ph is not None:
-        phone_units = build_char_phone_units(norm_text, word2ph, phones)
-    elif phone_units is not None:
+    if phone_units is not None:
         cursor = 0
         normalized_units = []
         for raw_unit in phone_units:
@@ -122,6 +129,8 @@ def clean_text_with_phone_units(text, language, version=None):
         if cursor != len(phones):
             raise RuntimeError(f"phone_units length mismatch: cursor={cursor}, phones={len(phones)}")
         phone_units = normalized_units
+    elif word2ph is not None:
+        phone_units = build_char_phone_units(norm_text, word2ph, phones)
 
     return phones, word2ph, norm_text, phone_units
 

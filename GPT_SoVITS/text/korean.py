@@ -462,18 +462,31 @@ def g2p_with_phone_units(text):
         )
 
     units = []
+    char_cursor = 0
+    text_len = len(text)
     for (source_kind, source_text), (transformed_kind, transformed_text) in zip(source_units, transformed_units):
         if source_kind != transformed_kind:
             raise RuntimeError(
                 f"Korean unit type mismatch: source={source_kind}:{source_text!r} "
                 f"transformed={transformed_kind}:{transformed_text!r}"
             )
+        if text.startswith(source_text, char_cursor):
+            char_start = char_cursor
+            char_cursor += len(source_text)
+            char_end = char_cursor
+        else:
+            # _transform_g2p_text may append a trailing punctuation token that has
+            # no direct source-text span. Keep it zero-width at the text end.
+            char_start = min(char_cursor, text_len)
+            char_end = char_start
         units.append(
             {
                 "unit_type": source_kind,
                 "text": source_text,
                 "norm_text": transformed_text,
                 "phones": [post_replace_ph(ch) for ch in transformed_text],
+                "char_start": int(char_start),
+                "char_end": int(char_end),
             }
         )
 

@@ -1,4 +1,7 @@
 import math
+import json
+import os
+import time
 
 import numpy as np
 import torch
@@ -15,6 +18,20 @@ import torch.distributions as D
 
 
 LRELU_SLOPE = 0.1
+VITS_RESBLOCK_BENCH_ENABLED = os.environ.get("GPTSOVITS_BENCH_VITS_RESBLOCK", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+VITS_RESBLOCK_BENCH_PREFIX = "GPTSOVITS_VITS_RESBLOCK "
+
+
+def _emit_vits_resblock_bench(metrics: dict):
+    payload = {}
+    for key, value in metrics.items():
+        payload[key] = round(value, 6) if isinstance(value, float) else value
+    print(VITS_RESBLOCK_BENCH_PREFIX + json.dumps(payload, ensure_ascii=False))
 
 
 class LayerNorm(nn.Module):
@@ -218,6 +235,9 @@ class WN(torch.nn.Module):
 class ResBlock1(torch.nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
         super(ResBlock1, self).__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.dilation = tuple(dilation)
         self.convs1 = nn.ModuleList(
             [
                 weight_norm(
@@ -291,18 +311,64 @@ class ResBlock1(torch.nn.Module):
         self.convs2.apply(init_weights)
 
     def forward(self, x, x_mask=None):
+        bench_enabled = VITS_RESBLOCK_BENCH_ENABLED
+        if bench_enabled:
+            t_total0 = time.perf_counter()
+            c_total0 = time.process_time()
+            pair_sec = []
+            pair_cpu_sec = []
+            conv1_sec = []
+            conv1_cpu_sec = []
+            conv2_sec = []
+            conv2_cpu_sec = []
         for c1, c2 in zip(self.convs1, self.convs2):
+            if bench_enabled:
+                t_pair0 = time.perf_counter()
+                c_pair0 = time.process_time()
             xt = F.leaky_relu(x, LRELU_SLOPE)
             if x_mask is not None:
                 xt = xt * x_mask
+            if bench_enabled:
+                t_conv0 = time.perf_counter()
+                c_conv0 = time.process_time()
             xt = c1(xt)
+            if bench_enabled:
+                conv1_sec.append(time.perf_counter() - t_conv0)
+                conv1_cpu_sec.append(time.process_time() - c_conv0)
             xt = F.leaky_relu(xt, LRELU_SLOPE)
             if x_mask is not None:
                 xt = xt * x_mask
+            if bench_enabled:
+                t_conv0 = time.perf_counter()
+                c_conv0 = time.process_time()
             xt = c2(xt)
+            if bench_enabled:
+                conv2_sec.append(time.perf_counter() - t_conv0)
+                conv2_cpu_sec.append(time.process_time() - c_conv0)
             x = xt + x
+            if bench_enabled:
+                pair_sec.append(time.perf_counter() - t_pair0)
+                pair_cpu_sec.append(time.process_time() - c_pair0)
         if x_mask is not None:
             x = x * x_mask
+        if bench_enabled:
+            _emit_vits_resblock_bench(
+                {
+                    "kind": "ResBlock1",
+                    "channels": self.channels,
+                    "kernel_size": self.kernel_size,
+                    "dilation": list(self.dilation),
+                    "frames": int(x.size(-1)),
+                    "pair_sec": pair_sec,
+                    "pair_cpu_sec": pair_cpu_sec,
+                    "conv1_sec": conv1_sec,
+                    "conv1_cpu_sec": conv1_cpu_sec,
+                    "conv2_sec": conv2_sec,
+                    "conv2_cpu_sec": conv2_cpu_sec,
+                    "total_sec": time.perf_counter() - t_total0,
+                    "total_cpu_sec": time.process_time() - c_total0,
+                }
+            )
         return x
 
     def remove_weight_norm(self):

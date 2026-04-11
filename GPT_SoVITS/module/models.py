@@ -1,7 +1,10 @@
 import warnings
 
 warnings.filterwarnings("ignore")
+import json
 import math
+import os
+import time
 
 import torch
 from torch import nn
@@ -23,6 +26,27 @@ from text import symbols2 as symbols_v2
 from torch.cuda.amp import autocast
 import contextlib
 import random
+
+VITS_GENERATOR_BENCH_ENABLED = os.environ.get("GPTSOVITS_BENCH_VITS_GENERATOR", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+VITS_GENERATOR_BENCH_DETAIL_ENABLED = os.environ.get("GPTSOVITS_BENCH_VITS_GENERATOR_DETAIL", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+VITS_GENERATOR_BENCH_PREFIX = "GPTSOVITS_VITS_GENERATOR "
+
+
+def _emit_vits_generator_bench(metrics: dict):
+    payload = {}
+    for key, value in metrics.items():
+        payload[key] = round(value, 6) if isinstance(value, float) else value
+    print(VITS_GENERATOR_BENCH_PREFIX + json.dumps(payload, ensure_ascii=False))
 
 
 class StochasticDurationPredictor(nn.Module):
@@ -483,23 +507,114 @@ class Generator(torch.nn.Module):
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
 
     def forward(self, x, g=None):
+        bench_enabled = VITS_GENERATOR_BENCH_ENABLED
+        input_frames = int(x.size(-1))
+        if bench_enabled:
+            t_total0 = time.perf_counter()
+            c_total0 = time.process_time()
+            conv_pre_sec = cond_sec = upsample_sec = resblock_sec = post_sec = 0.0
+            conv_pre_cpu_sec = cond_cpu_sec = upsample_cpu_sec = resblock_cpu_sec = post_cpu_sec = 0.0
+            upsample_stage_sec = []
+            upsample_stage_cpu_sec = []
+            resblock_stage_sec = []
+            resblock_stage_cpu_sec = []
+            resblock_block_sec = []
+            resblock_block_cpu_sec = []
+
+            t_stage0 = time.perf_counter()
+            c_stage0 = time.process_time()
         x = self.conv_pre(x)
+        if bench_enabled:
+            conv_pre_sec = time.perf_counter() - t_stage0
+            conv_pre_cpu_sec = time.process_time() - c_stage0
+
         if g is not None:
+            if bench_enabled:
+                t_stage0 = time.perf_counter()
+                c_stage0 = time.process_time()
             x = x + self.cond(g)
+            if bench_enabled:
+                cond_sec = time.perf_counter() - t_stage0
+                cond_cpu_sec = time.process_time() - c_stage0
 
         for i in range(self.num_upsamples):
+            if bench_enabled:
+                t_stage0 = time.perf_counter()
+                c_stage0 = time.process_time()
             x = F.leaky_relu(x, modules.LRELU_SLOPE)
             x = self.ups[i](x)
+            if bench_enabled:
+                stage_wall = time.perf_counter() - t_stage0
+                stage_cpu = time.process_time() - c_stage0
+                upsample_sec += stage_wall
+                upsample_cpu_sec += stage_cpu
+                upsample_stage_sec.append(stage_wall)
+                upsample_stage_cpu_sec.append(stage_cpu)
+
+            if bench_enabled:
+                t_stage0 = time.perf_counter()
+                c_stage0 = time.process_time()
             xs = None
+            block_wall_vals = []
+            block_cpu_vals = []
             for j in range(self.num_kernels):
+                if bench_enabled and VITS_GENERATOR_BENCH_DETAIL_ENABLED:
+                    t_block0 = time.perf_counter()
+                    c_block0 = time.process_time()
                 if xs is None:
                     xs = self.resblocks[i * self.num_kernels + j](x)
                 else:
                     xs += self.resblocks[i * self.num_kernels + j](x)
+                if bench_enabled and VITS_GENERATOR_BENCH_DETAIL_ENABLED:
+                    block_wall_vals.append(time.perf_counter() - t_block0)
+                    block_cpu_vals.append(time.process_time() - c_block0)
             x = xs / self.num_kernels
+            if bench_enabled:
+                stage_wall = time.perf_counter() - t_stage0
+                stage_cpu = time.process_time() - c_stage0
+                resblock_sec += stage_wall
+                resblock_cpu_sec += stage_cpu
+                resblock_stage_sec.append(stage_wall)
+                resblock_stage_cpu_sec.append(stage_cpu)
+                if VITS_GENERATOR_BENCH_DETAIL_ENABLED:
+                    resblock_block_sec.append(block_wall_vals)
+                    resblock_block_cpu_sec.append(block_cpu_vals)
+
+        if bench_enabled:
+            t_stage0 = time.perf_counter()
+            c_stage0 = time.process_time()
         x = F.leaky_relu(x)
         x = self.conv_post(x)
         x = torch.tanh(x)
+        if bench_enabled:
+            post_sec = time.perf_counter() - t_stage0
+            post_cpu_sec = time.process_time() - c_stage0
+            _emit_vits_generator_bench(
+                {
+                    "input_frames": input_frames,
+                    "output_frames": int(x.size(-1)),
+                    "num_upsamples": self.num_upsamples,
+                    "num_kernels": self.num_kernels,
+                    "conv_pre_sec": conv_pre_sec,
+                    "conv_pre_cpu_sec": conv_pre_cpu_sec,
+                    "cond_sec": cond_sec,
+                    "cond_cpu_sec": cond_cpu_sec,
+                    "upsample_sec": upsample_sec,
+                    "upsample_cpu_sec": upsample_cpu_sec,
+                    "upsample_stage_sec": upsample_stage_sec,
+                    "upsample_stage_cpu_sec": upsample_stage_cpu_sec,
+                    "resblock_sec": resblock_sec,
+                    "resblock_cpu_sec": resblock_cpu_sec,
+                    "resblock_stage_sec": resblock_stage_sec,
+                    "resblock_stage_cpu_sec": resblock_stage_cpu_sec,
+                    "resblock_block_sec": resblock_block_sec if VITS_GENERATOR_BENCH_DETAIL_ENABLED else [],
+                    "resblock_block_cpu_sec": resblock_block_cpu_sec if VITS_GENERATOR_BENCH_DETAIL_ENABLED else [],
+                    "post_sec": post_sec,
+                    "post_cpu_sec": post_cpu_sec,
+                    "total_sec": time.perf_counter() - t_total0,
+                    "total_cpu_sec": time.process_time() - c_total0,
+                }
+            )
 
         return x
 
@@ -990,21 +1105,21 @@ class SynthesizerTrn(nn.Module):
         o = self.dec((z * y_mask)[:, :, :], g=ge)
         return o, y_mask, (z, z_p, m_p, logs_p)
 
-
-    @torch.no_grad()
-    def decode(self, codes, text, refer, noise_scale=0.5, speed=1, sv_emb=None):
-        def get_ge(refer, sv_emb):
+    def build_decode_condition(self, refer, sv_emb=None):
+        def get_ge(single_refer, single_sv_emb):
             ge = None
-            if refer is not None:
-                refer_lengths = torch.LongTensor([refer.size(2)]).to(refer.device)
-                refer_mask = torch.unsqueeze(commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
+            if single_refer is not None:
+                refer_lengths = torch.LongTensor([single_refer.size(2)]).to(single_refer.device)
+                refer_mask = torch.unsqueeze(commons.sequence_mask(refer_lengths, single_refer.size(2)), 1).to(
+                    single_refer.dtype
+                )
                 if self.version == "v1":
-                    ge = self.ref_enc(refer * refer_mask, refer_mask)
+                    ge = self.ref_enc(single_refer * refer_mask, refer_mask)
                 else:
-                    ge = self.ref_enc(refer[:, :704] * refer_mask, refer_mask)
+                    ge = self.ref_enc(single_refer[:, :704] * refer_mask, refer_mask)
                 if self.is_v2pro:
-                    sv_emb = self.sv_emb(sv_emb)  # B*20480->B*512
-                    ge += sv_emb.unsqueeze(-1)
+                    single_sv_emb = self.sv_emb(single_sv_emb)  # B*20480->B*512
+                    ge += single_sv_emb.unsqueeze(-1)
                     ge = self.prelu(ge)
             return ge
 
@@ -1017,8 +1132,87 @@ class SynthesizerTrn(nn.Module):
         else:
             ge = get_ge(refer, sv_emb)
 
-        y_lengths = torch.LongTensor([codes.size(2) * 2]).to(codes.device)
-        text_lengths = torch.LongTensor([text.size(-1)]).to(text.device)
+        ge_text = self.ge_to512(ge.transpose(2, 1)).transpose(2, 1) if self.is_v2pro and ge is not None else ge
+        return ge, ge_text
+
+    def _expand_decode_condition_batch(self, cond, batch_size, name):
+        if cond is None:
+            return None
+        if cond.size(0) == batch_size:
+            return cond
+        if cond.size(0) != 1:
+            raise ValueError(f"{name} batch size mismatch: expected 1 or {batch_size}, got {cond.size(0)}")
+        return cond.expand(batch_size, -1, -1)
+
+    def _prepare_decode_lengths(self, codes, text, code_lengths=None, text_lengths=None):
+        if codes.ndim != 3:
+            raise ValueError(f"codes shape mismatch: expected 3 dims [n_q, B, T], got {tuple(codes.shape)}")
+        batch_size = int(codes.size(1))
+        if int(text.size(0)) != batch_size:
+            raise ValueError(f"text batch size mismatch: expected {batch_size}, got {text.size(0)}")
+
+        if code_lengths is None:
+            code_lengths = torch.full((batch_size,), int(codes.size(2)), device=codes.device, dtype=torch.long)
+        else:
+            code_lengths = torch.as_tensor(code_lengths, device=codes.device, dtype=torch.long)
+            if code_lengths.ndim != 1 or int(code_lengths.numel()) != batch_size:
+                raise ValueError(f"code_lengths shape mismatch: expected ({batch_size},), got {tuple(code_lengths.shape)}")
+
+        if text_lengths is None:
+            text_lengths = torch.full((batch_size,), int(text.size(1)), device=text.device, dtype=torch.long)
+        else:
+            text_lengths = torch.as_tensor(text_lengths, device=text.device, dtype=torch.long)
+            if text_lengths.ndim != 1 or int(text_lengths.numel()) != batch_size:
+                raise ValueError(f"text_lengths shape mismatch: expected ({batch_size},), got {tuple(text_lengths.shape)}")
+
+        y_lengths = code_lengths * 2
+        return y_lengths, text_lengths
+
+    def _sample_decode_noise_like(self, target, y_lengths, sequential=False):
+        if not sequential:
+            return torch.randn_like(target)
+
+        noise = torch.zeros_like(target)
+        for idx, length in enumerate(y_lengths.tolist()):
+            valid_len = int(length)
+            if valid_len <= 0:
+                continue
+            noise[idx, :, :valid_len] = torch.randn(
+                (target.size(1), valid_len),
+                device=target.device,
+                dtype=target.dtype,
+            )
+        return noise
+
+    @torch.no_grad()
+    def prepare_decode_latent(
+        self,
+        codes,
+        text,
+        refer,
+        noise_scale=0.5,
+        speed=1,
+        sv_emb=None,
+        ge=None,
+        ge_text=None,
+        code_lengths=None,
+        text_lengths=None,
+        sequential_noise=False,
+    ):
+        if ge is None:
+            ge, ge_text = self.build_decode_condition(refer, sv_emb)
+        elif ge_text is None:
+            ge_text = self.ge_to512(ge.transpose(2, 1)).transpose(2, 1) if self.is_v2pro else ge
+
+        batch_size = int(codes.size(1))
+        ge = self._expand_decode_condition_batch(ge, batch_size, "ge")
+        ge_text = self._expand_decode_condition_batch(ge_text, batch_size, "ge_text")
+        y_lengths, text_lengths = self._prepare_decode_lengths(
+            codes,
+            text,
+            code_lengths=code_lengths,
+            text_lengths=text_lengths,
+        )
 
         quantized = self.quantizer.decode(codes)
         if self.semantic_frame_rate == "25hz":
@@ -1028,45 +1222,78 @@ class SynthesizerTrn(nn.Module):
             y_lengths,
             text,
             text_lengths,
-            self.ge_to512(ge.transpose(2, 1)).transpose(2, 1) if self.is_v2pro else ge,
+            ge_text,
             speed,
         )
-        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+        noise = self._sample_decode_noise_like(m_p, y_lengths, sequential=sequential_noise)
+        z_p = m_p + noise * torch.exp(logs_p) * noise_scale
 
         z = self.flow(z_p, y_mask, g=ge, reverse=True)
+        return z, y_mask, ge, ge_text, y_lengths, text_lengths
+
+    @torch.no_grad()
+    def decode(
+        self,
+        codes,
+        text,
+        refer,
+        noise_scale=0.5,
+        speed=1,
+        sv_emb=None,
+        ge=None,
+        ge_text=None,
+        code_lengths=None,
+        text_lengths=None,
+    ):
+        z, y_mask, ge, _, _, _ = self.prepare_decode_latent(
+            codes,
+            text,
+            refer,
+            noise_scale=noise_scale,
+            speed=speed,
+            sv_emb=sv_emb,
+            ge=ge,
+            ge_text=ge_text,
+            code_lengths=code_lengths,
+            text_lengths=text_lengths,
+            sequential_noise=False,
+        )
 
         o = self.dec((z * y_mask)[:, :, :], g=ge)
         return o
 
 
     @torch.no_grad()
-    def decode_streaming(self, codes, text, refer, noise_scale=0.5, speed=1, sv_emb=None, result_length:int=None, overlap_frames:torch.Tensor=None, padding_length:int=None):
-        def get_ge(refer, sv_emb):
-            ge = None
-            if refer is not None:
-                refer_lengths = torch.LongTensor([refer.size(2)]).to(refer.device)
-                refer_mask = torch.unsqueeze(commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
-                if self.version == "v1":
-                    ge = self.ref_enc(refer * refer_mask, refer_mask)
-                else:
-                    ge = self.ref_enc(refer[:, :704] * refer_mask, refer_mask)
-                if self.is_v2pro:
-                    sv_emb = self.sv_emb(sv_emb)  # B*20480->B*512
-                    ge += sv_emb.unsqueeze(-1)
-                    ge = self.prelu(ge)
-            return ge
+    def decode_streaming(
+        self,
+        codes,
+        text,
+        refer,
+        noise_scale=0.5,
+        speed=1,
+        sv_emb=None,
+        result_length:int=None,
+        overlap_frames:torch.Tensor=None,
+        padding_length:int=None,
+        ge=None,
+        ge_text=None,
+        code_lengths=None,
+        text_lengths=None,
+    ):
+        if ge is None:
+            ge, ge_text = self.build_decode_condition(refer, sv_emb)
+        elif ge_text is None:
+            ge_text = self.ge_to512(ge.transpose(2, 1)).transpose(2, 1) if self.is_v2pro else ge
 
-        if type(refer) == list:
-            ges = []
-            for idx, _refer in enumerate(refer):
-                ge = get_ge(_refer, sv_emb[idx] if self.is_v2pro else None)
-                ges.append(ge)
-            ge = torch.stack(ges, 0).mean(0)
-        else:
-            ge = get_ge(refer, sv_emb)
-
-        y_lengths = torch.LongTensor([codes.size(2) * 2]).to(codes.device)
-        text_lengths = torch.LongTensor([text.size(-1)]).to(text.device)
+        batch_size = int(codes.size(1))
+        ge = self._expand_decode_condition_batch(ge, batch_size, "ge")
+        ge_text = self._expand_decode_condition_batch(ge_text, batch_size, "ge_text")
+        y_lengths, text_lengths = self._prepare_decode_lengths(
+            codes,
+            text,
+            code_lengths=code_lengths,
+            text_lengths=text_lengths,
+        )
 
         quantized = self.quantizer.decode(codes)
         if self.semantic_frame_rate == "25hz":
@@ -1078,7 +1305,7 @@ class SynthesizerTrn(nn.Module):
             y_lengths,
             text,
             text_lengths,
-            self.ge_to512(ge.transpose(2, 1)).transpose(2, 1) if self.is_v2pro else ge,
+            ge_text,
             speed,
             result_length=result_length, 
             overlap_frames=overlap_frames, 

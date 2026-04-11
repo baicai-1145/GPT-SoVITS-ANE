@@ -6,6 +6,7 @@ import ToJyutping
 
 from text.symbols import punctuation
 from text.zh_normalization.text_normlization import TextNormalizer
+from text.phone_units import finalize_phone_units
 
 normalizer = lambda x: cn2an.transform(x, "an2cn")
 text_normalizer = TextNormalizer()
@@ -173,6 +174,41 @@ def jyuping_to_initials_finals_tones(jyuping_syllables):
     return phones, word2ph
 
 
+def _jyutping_syllable_to_phones(syllable):
+    if syllable in punctuation:
+        return [syllable]
+    if syllable == "_":
+        return [syllable]
+
+    try:
+        tone = int(syllable[-1])
+        syllable_without_tone = syllable[:-1]
+    except ValueError:
+        tone = 0
+        syllable_without_tone = syllable
+
+    for initial in INITIALS:
+        if syllable_without_tone.startswith(initial):
+            if syllable_without_tone.startswith("nga"):
+                initials_finals = [
+                    syllable_without_tone[:2],
+                    syllable_without_tone[2:] or syllable_without_tone[-1],
+                ]
+                tones = [-1, tone]
+            else:
+                final = syllable_without_tone[len(initial) :] or initial[-1]
+                initials_finals = [initial, final]
+                tones = [-1, tone]
+            phones = []
+            for a, b in zip(initials_finals, tones):
+                todo = f"{a}{b}" if b not in [-1, 0] else a
+                if todo not in punctuation_set:
+                    todo = f"Y{todo}"
+                phones.append(todo)
+            return phones
+    raise ValueError(f"Failed to map jyutping syllable to phones: {syllable}")
+
+
 def get_jyutping(text):
     jyutping_array = []
     punct_pattern = re.compile(r"^[{}]+$".format(re.escape("".join(punctuation))))
@@ -194,6 +230,47 @@ def get_jyutping(text):
     return jyutping_array
 
 
+def get_jyutping_units(text):
+    units = []
+    punct_pattern = re.compile(r"^[{}]+$".format(re.escape("".join(punctuation))))
+    syllables = ToJyutping.get_jyutping_list(text)
+    char_cursor = 0
+
+    for word, syllable in syllables:
+        if punct_pattern.match(word):
+            puncts = re.split(r"([{}])".format(re.escape("".join(punctuation))), word)
+            for punct in puncts:
+                if len(punct) == 0:
+                    continue
+                units.append(
+                    {
+                        "unit_type": "punct",
+                        "text": punct,
+                        "norm_text": punct,
+                        "syllables": [punct],
+                        "char_start": int(char_cursor),
+                        "char_end": int(char_cursor + len(punct)),
+                    }
+                )
+                char_cursor += len(punct)
+        else:
+            if not re.search(r"^([a-z]+[1-6]+[ ]?)+$", syllable):
+                raise ValueError(f"Failed to convert {word} to jyutping: {syllable}")
+            syllable_list = [item for item in syllable.split(" ") if item]
+            units.append(
+                {
+                    "unit_type": "word",
+                    "text": word,
+                    "norm_text": word,
+                    "syllables": syllable_list,
+                    "char_start": int(char_cursor),
+                    "char_end": int(char_cursor + len(word)),
+                }
+            )
+            char_cursor += len(word)
+    return units
+
+
 def get_bert_feature(text, word2ph):
     from text import chinese_bert
 
@@ -210,6 +287,31 @@ def g2p(text):
     # tones = [0] + tones + [0]
     # word2ph = [1] + word2ph + [1]
     return phones, word2ph
+
+
+def g2p_with_phone_units(text):
+    units = get_jyutping_units(text)
+    phones = []
+    word2ph = []
+    phone_units = []
+    for unit in units:
+        unit_phones = []
+        for syllable in unit["syllables"]:
+            syllable_phones = _jyutping_syllable_to_phones(syllable)
+            unit_phones.extend(syllable_phones)
+            phones.extend(syllable_phones)
+            word2ph.append(len(syllable_phones))
+        phone_units.append(
+            {
+                "unit_type": unit["unit_type"],
+                "text": unit["text"],
+                "norm_text": unit["norm_text"],
+                "phones": unit_phones,
+                "char_start": int(unit["char_start"]),
+                "char_end": int(unit["char_end"]),
+            }
+        )
+    return phones, word2ph, finalize_phone_units(phone_units)
 
 
 if __name__ == "__main__":

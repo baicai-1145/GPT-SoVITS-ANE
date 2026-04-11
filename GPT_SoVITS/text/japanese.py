@@ -231,6 +231,8 @@ def _build_word_unit(word_info, unit_tokens):
         "unit_type": "word",
         "text": word_info.get("string", ""),
         "norm_text": (word_info.get("pron") or word_info.get("read") or word_info.get("string") or "").replace("’", ""),
+        "pos": word_info.get("pos", ""),
+        "pos_group1": word_info.get("pos_group1", ""),
         "phones": unit_tokens,
     }
 
@@ -245,6 +247,26 @@ def _build_prosody_units(full_tokens, start, end):
         }
         for idx in range(start, end)
     ]
+
+
+def _assign_sentence_char_spans(units, sentence):
+    cursor = 0
+    assigned = []
+    for unit in units:
+        item = dict(unit)
+        unit_type = item.get("unit_type")
+        if unit_type in {"word", "word_group"}:
+            text = item.get("text", "")
+            item["char_start"] = int(cursor)
+            cursor += len(text)
+            item["char_end"] = int(cursor)
+        else:
+            item["char_start"] = int(cursor)
+            item["char_end"] = int(cursor)
+        assigned.append(item)
+    if cursor != len(sentence):
+        return units
+    return assigned
 
 
 def _align_frontend_words(frontend, full_tokens, word_index, cursor):
@@ -289,7 +311,7 @@ def _sentence_phone_units(sentence, with_prosody=True):
                 "phones": full_tokens,
             }
         ]
-    return units
+    return _assign_sentence_char_spans(units, sentence)
 
 
 def text_normalize(text):
@@ -396,12 +418,22 @@ def g2p_with_phone_units(norm_text, with_prosody=True):
     marks = re.findall(_japanese_marks, text)
 
     units = []
+    char_cursor = 0
     for idx, sentence in enumerate(sentences):
         if re.match(_japanese_characters, sentence):
-            units.extend(_sentence_phone_units(sentence, with_prosody=with_prosody))
+            sentence_units = _sentence_phone_units(sentence, with_prosody=with_prosody)
+            for unit in sentence_units:
+                item = dict(unit)
+                if "char_start" in item:
+                    item["char_start"] = int(item["char_start"]) + char_cursor
+                if "char_end" in item:
+                    item["char_end"] = int(item["char_end"]) + char_cursor
+                units.append(item)
+        char_cursor += len(sentence)
         if idx < len(marks):
             mark = marks[idx]
             if mark == " ":
+                char_cursor += len(mark)
                 continue
             cleaned_mark = mark.replace(" ", "")
             units.append(
@@ -410,8 +442,11 @@ def g2p_with_phone_units(norm_text, with_prosody=True):
                     "text": mark,
                     "norm_text": cleaned_mark,
                     "phones": [post_replace_ph(cleaned_mark)],
+                    "char_start": int(char_cursor),
+                    "char_end": int(char_cursor + len(mark)),
                 }
             )
+            char_cursor += len(mark)
 
     units = finalize_phone_units(units)
     return flatten_phone_units(units), units

@@ -3,6 +3,7 @@ import json
 import math
 import os
 import random
+import subprocess
 import sys
 import time
 import traceback
@@ -34,12 +35,19 @@ from transformers import AutoModelForMaskedLM, AutoTokenizer
 from tools.audio_utils import load_audio_tensor
 from tools.audio_sr import AP_BWE
 from tools.i18n.i18n import I18nAuto, scan_language_list
+from TTS_infer_pack.pause_splitter import maybe_secondary_split_preprocess_items
 from TTS_infer_pack.text_segmentation_method import splits
 from TTS_infer_pack.TextPreprocessor import TextPreprocessor
 from sv import SV
 
 resample_transform_dict = {}
 BENCH_CPU_ENABLED = os.environ.get("GPTSOVITS_BENCH_CPU", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+BENCH_RSS_ENABLED = os.environ.get("GPTSOVITS_BENCH_RSS", "").strip().lower() in {
     "1",
     "true",
     "yes",
@@ -55,6 +63,62 @@ def calc_cpu_util_pct(cpu_time_sec: float, wall_time_sec: float, cpu_count: int)
     if cpu_time_sec <= 0 or wall_time_sec <= 0 or cpu_count <= 0:
         return 0.0
     return max(0.0, cpu_time_sec / wall_time_sec / cpu_count * 100.0)
+
+
+def get_process_rss_bytes() -> int:
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.Process(os.getpid()).memory_info().rss)
+    except Exception:
+        pass
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+                ctypes.windll.kernel32.GetCurrentProcess(),
+                ctypes.byref(counters),
+                counters.cb,
+            )
+            if ok:
+                return int(counters.WorkingSetSize)
+        except Exception:
+            return 0
+
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        rss_kb = int(result.stdout.strip() or "0")
+        return rss_kb * 1024
+    except Exception:
+        return 0
+
+
+def rss_bytes_to_mb(rss_bytes: int) -> float:
+    return rss_bytes / 1024.0 / 1024.0
 
 
 def resample(audio_tensor, sr0, sr1, device):
@@ -607,6 +671,9 @@ class TTS:
 
             vits_model.cfm = vits_model.cfm.merge_and_unload()
 
+        if model_version not in v3v4set and hasattr(vits_model, "dec"):
+            vits_model.dec.remove_weight_norm()
+
         vits_model = vits_model.to(self.configs.device)
         vits_model = vits_model.eval()
 
@@ -797,6 +864,9 @@ class TTS:
             "ref_key": None,
             "refer_audio_spec": None,
             "sv_emb": None,
+            "decode_ref_key": None,
+            "decode_ge": None,
+            "decode_ge_text": None,
             "prompt_key": None,
             "prompt_semantic_tokens": None,
             "prompt_phones": None,
@@ -847,8 +917,26 @@ class TTS:
             runtime["prompt_key"] = None
             runtime["prompt_semantic_tokens"] = None
             runtime["prompt_phones"] = None
+            runtime["decode_ref_key"] = None
+            runtime["decode_ge"] = None
+            runtime["decode_ge_text"] = None
             runtime["vocoder_refer_audio_spec"] = None
         return refer_audio_spec, sv_emb
+
+    def _get_runtime_decode_condition(self):
+        runtime = self._get_prompt_runtime_cache()
+        ref_key = self._get_ref_runtime_key()
+        refer_audio_spec, sv_emb = self._get_runtime_refer_audio_spec_and_sv_emb()
+        if (
+            runtime.get("decode_ref_key") != ref_key
+            or runtime.get("decode_ge") is None
+            or runtime.get("decode_ge_text") is None
+        ):
+            decode_ge, decode_ge_text = self.vits_model.build_decode_condition(refer_audio_spec, sv_emb)
+            runtime["decode_ref_key"] = ref_key
+            runtime["decode_ge"] = decode_ge
+            runtime["decode_ge_text"] = decode_ge_text
+        return runtime["decode_ge"], runtime["decode_ge_text"]
 
     def _get_runtime_vocoder_prompt_inputs(self):
         runtime = self._get_prompt_runtime_cache()
@@ -884,8 +972,12 @@ class TTS:
     def _get_ref_spec(self, ref_audio_path):
         raw_audio, raw_sr = load_audio_tensor(ref_audio_path)
         raw_audio = raw_audio.to(self.configs.device).float()
-        self.prompt_cache["raw_audio"] = raw_audio
-        self.prompt_cache["raw_sr"] = raw_sr
+        if self.configs.use_vocoder:
+            self.prompt_cache["raw_audio"] = raw_audio
+            self.prompt_cache["raw_sr"] = raw_sr
+        else:
+            self.prompt_cache.pop("raw_audio", None)
+            self.prompt_cache.pop("raw_sr", None)
 
         if raw_sr != self.configs.sampling_rate:
             audio = raw_audio.to(self.configs.device)
@@ -1130,7 +1222,8 @@ class TTS:
                     "speed_factor":1.0,           # float. control the speed of the synthesized audio.
                     "fragment_interval":0.3,      # float. to control the interval of the audio fragment.
                     "seed": -1,                   # int. random seed for reproducibility.
-                    "parallel_infer": True,       # bool. whether to use parallel inference.
+                    "parallel_infer": True,       # bool. whether to use parallel inference for t2s.
+                    "vits_parallel_infer": True,  # bool. whether to use parallel inference for vits; defaults to parallel_infer.
                     "repetition_penalty": 1.35,   # float. repetition penalty for T2S model.
                     "sample_steps": 32,           # int. number of sampling steps for VITS model V3.
                     "super_sampling": False,      # bool. whether to use super-sampling for audio when using VITS model V3.
@@ -1139,6 +1232,11 @@ class TTS:
                     "overlap_length": 2,          # int. overlap length of semantic tokens for streaming mode.
                     "min_chunk_length": 16,        # int. The minimum chunk length of semantic tokens for streaming mode. (affects audio chunk size)
                     "fixed_length_chunk": False,  # bool. When turned on, it can achieve faster streaming response, but with lower quality. (lower quality, faster response speed)
+                    "secondary_split_long_items": False,      # bool. opt-in secondary split for overlong preprocess items before batching
+                    "secondary_split_max_phone_len": 110,     # int. target max phone length for each segment after secondary split
+                    "secondary_split_min_phone_len": 24,      # int. minimum phone length allowed on either side of a secondary split
+                    "secondary_split_max_splits_per_item": 1, # int. max additional splits applied to one preprocess item
+                    "secondary_split_min_quality": 2.5,       # float. minimum candidate quality score to accept a secondary split
                 }
         returns:
             Tuple[int, np.ndarray]: sampling rate and audio data.
@@ -1165,6 +1263,7 @@ class TTS:
         seed = -1 if seed in ["", None] else seed
         actual_seed = set_seed(seed)
         parallel_infer = inputs.get("parallel_infer", True)
+        vits_parallel_infer = inputs.get("vits_parallel_infer", parallel_infer)
         repetition_penalty = inputs.get("repetition_penalty", 1.35)
         sample_steps = inputs.get("sample_steps", 32)
         super_sampling = inputs.get("super_sampling", False)
@@ -1172,10 +1271,15 @@ class TTS:
         overlap_length = inputs.get("overlap_length", 2)
         min_chunk_length = inputs.get("min_chunk_length", 16)
         fixed_length_chunk = inputs.get("fixed_length_chunk", False)
+        secondary_split_long_items = inputs.get("secondary_split_long_items", False)
+        secondary_split_max_phone_len = inputs.get("secondary_split_max_phone_len", 110)
+        secondary_split_min_phone_len = inputs.get("secondary_split_min_phone_len", 24)
+        secondary_split_max_splits_per_item = inputs.get("secondary_split_max_splits_per_item", 1)
+        secondary_split_min_quality = inputs.get("secondary_split_min_quality", 2.5)
         chunk_split_thershold = 0.0 # 该值代表语义token与mute token的余弦相似度阈值，若大于该阈值，则视为可切分点。
 
         if parallel_infer and not streaming_mode:
-            print(i18n("并行推理模式已开启"))
+            print(i18n("T2S并行推理模式已开启"))
             self.t2s_model.model.infer_panel = self.t2s_model.model.infer_panel_batch_infer
         elif not parallel_infer and streaming_mode and not self.configs.use_vocoder:
             print(i18n("流式推理模式已开启"))
@@ -1194,7 +1298,7 @@ class TTS:
             parallel_infer = False
             self.t2s_model.model.infer_panel = self.t2s_model.model.infer_panel_naive
         else:
-            print(i18n("朴素推理模式已开启"))
+            print(i18n("T2S朴素推理模式已开启"))
             self.t2s_model.model.infer_panel = self.t2s_model.model.infer_panel_naive_batched
 
         if return_fragment and streaming_mode:
@@ -1206,16 +1310,21 @@ class TTS:
             split_bucket = False
 
 
-        if split_bucket and speed_factor == 1.0 and not (self.configs.use_vocoder and parallel_infer):
+        if split_bucket and speed_factor == 1.0 and not (self.configs.use_vocoder and vits_parallel_infer):
             print(i18n("分桶处理模式已开启"))
         elif speed_factor != 1.0:
             print(i18n("语速调节不支持分桶处理，已自动关闭分桶处理"))
             split_bucket = False
-        elif self.configs.use_vocoder and parallel_infer:
-            print(i18n("当开启并行推理模式时，SoVits V3/4模型不支持分桶处理，已自动关闭分桶处理"))
+        elif self.configs.use_vocoder and vits_parallel_infer:
+            print(i18n("当开启VITS并行推理模式时，SoVits V3/4模型不支持分桶处理，已自动关闭分桶处理"))
             split_bucket = False
         else:
             print(i18n("分桶处理模式已关闭"))
+
+        if vits_parallel_infer:
+            print(i18n("VITS并行推理模式已开启"))
+        else:
+            print(i18n("VITS串行推理模式已开启"))
 
         # if fragment_interval < 0.01:
         #     fragment_interval = 0.01
@@ -1238,6 +1347,43 @@ class TTS:
             raise ValueError(
                 "ref_audio_path cannot be empty, when the reference audio is not set using set_ref_audio()"
             )
+
+        rss_stats = None
+        if BENCH_RSS_ENABLED:
+            rss_stats = {
+                "run_start_rss_bytes": get_process_rss_bytes(),
+                "ref_done_rss_bytes": 0,
+                "frontend_done_rss_bytes": 0,
+                "infer_setup_done_rss_bytes": 0,
+                "run_end_rss_bytes": 0,
+                "peak_rss_bytes": 0,
+                "peak_stage": None,
+                "peak_batch_idx": None,
+                "t2s_peak_rss_bytes": 0,
+                "t2s_peak_batch_idx": None,
+                "vits_peak_rss_bytes": 0,
+                "vits_peak_batch_idx": None,
+                "batch_count": 0,
+            }
+
+            def update_rss_peak(stage: str, batch_idx: int | None = None) -> int:
+                rss_bytes = get_process_rss_bytes()
+                if rss_bytes <= 0:
+                    return 0
+                if rss_bytes > rss_stats["peak_rss_bytes"]:
+                    rss_stats["peak_rss_bytes"] = rss_bytes
+                    rss_stats["peak_stage"] = stage
+                    rss_stats["peak_batch_idx"] = batch_idx
+                if stage == "t2s" and rss_bytes > rss_stats["t2s_peak_rss_bytes"]:
+                    rss_stats["t2s_peak_rss_bytes"] = rss_bytes
+                    rss_stats["t2s_peak_batch_idx"] = batch_idx
+                if stage == "vits" and rss_bytes > rss_stats["vits_peak_rss_bytes"]:
+                    rss_stats["vits_peak_rss_bytes"] = rss_bytes
+                    rss_stats["vits_peak_batch_idx"] = batch_idx
+                return rss_bytes
+
+            update_rss_peak("run_start")
+            rss_stats["ref_done_rss_bytes"] = rss_stats["run_start_rss_bytes"]
 
         ###### setting reference audio and prompt text preprocessing ########
         t0 = time.perf_counter()
@@ -1284,12 +1430,26 @@ class TTS:
         ###### text preprocessing ########
         t1 = time.perf_counter()
         c1 = get_process_cpu_time_sec() if BENCH_CPU_ENABLED else 0.0
+        if rss_stats is not None:
+            rss_stats["ref_done_rss_bytes"] = update_rss_peak("ref_done")
         data: list = None
         if not (return_fragment or streaming_mode):
             data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
             if len(data) == 0:
                 yield 16000, np.zeros(int(16000), dtype=np.int16)
                 return
+            if secondary_split_long_items:
+                data, split_stats = maybe_secondary_split_preprocess_items(
+                    data,
+                    text_lang,
+                    max_phone_len=secondary_split_max_phone_len,
+                    min_phone_len=secondary_split_min_phone_len,
+                    max_splits_per_item=secondary_split_max_splits_per_item,
+                    min_quality_score=secondary_split_min_quality,
+                )
+                if split_stats.get("applied_splits", 0) > 0:
+                    print(f"############ {i18n('二次长句切分')} ############")
+                    print(split_stats)
 
             batch_index_list: list = None
             data, batch_index_list = self.to_batch(
@@ -1340,6 +1500,9 @@ class TTS:
 
         t2 = time.perf_counter()
         c2 = get_process_cpu_time_sec() if BENCH_CPU_ENABLED else 0.0
+        if rss_stats is not None:
+            rss_stats["batch_count"] = int(len(data)) if isinstance(data, list) else 0
+            rss_stats["frontend_done_rss_bytes"] = update_rss_peak("frontend_done")
         try:
             print("############ 推理 ############")
             ###### inference ######
@@ -1351,7 +1514,13 @@ class TTS:
             is_first_package = True
             output_sr = self.configs.sampling_rate if not self.configs.use_vocoder else self.vocoder_configs["sr"]
             refer_audio_spec, sv_emb = self._get_runtime_refer_audio_spec_and_sv_emb()
-            for item in data:
+            decode_ge = None
+            decode_ge_text = None
+            if not self.configs.use_vocoder and hasattr(self.vits_model, "build_decode_condition"):
+                decode_ge, decode_ge_text = self._get_runtime_decode_condition()
+            if rss_stats is not None:
+                rss_stats["infer_setup_done_rss_bytes"] = update_rss_peak("infer_setup")
+            for batch_idx, item in enumerate(data):
                 t3 = time.perf_counter()
                 c3 = get_process_cpu_time_sec() if BENCH_CPU_ENABLED else 0.0
                 if return_fragment or streaming_mode:
@@ -1396,9 +1565,19 @@ class TTS:
                     if BENCH_CPU_ENABLED:
                         c4 = get_process_cpu_time_sec()
                         cpu_34 += c4 - c3
+                    if rss_stats is not None:
+                        update_rss_peak("t2s", batch_idx=batch_idx)
 
 
                     batch_audio_fragment = []
+                    del all_bert_features
+                    del all_phoneme_ids
+                    del all_phoneme_lens
+                    del batch_phones_len
+                    del norm_text
+                    del max_len
+                    del item
+                    del prompt
 
                     # ## vits并行推理 method 1
                     # pred_semantic_list = [item[-idx:] for item, idx in zip(pred_semantic_list, idx_list)]
@@ -1414,7 +1593,7 @@ class TTS:
                     #     ))
                     print(f"############ {i18n('合成音频')} ############")
                     if not self.configs.use_vocoder:
-                        if speed_factor == 1.0:
+                        if vits_parallel_infer and speed_factor == 1.0:
                             print(f"{i18n('并行合成中')}...")
                             # ## vits并行推理 method 2
                             pred_semantic_list = [item[-idx:] for item, idx in zip(pred_semantic_list, idx_list)]
@@ -1430,7 +1609,13 @@ class TTS:
                             _batch_phones = torch.cat(batch_phones).unsqueeze(0).to(self.configs.device)
 
                             _batch_audio_fragment = self.vits_model.decode(
-                                    all_pred_semantic, _batch_phones, refer_audio_spec, speed=speed_factor, sv_emb=sv_emb
+                                    all_pred_semantic,
+                                    _batch_phones,
+                                    refer_audio_spec,
+                                    speed=speed_factor,
+                                    sv_emb=sv_emb,
+                                    ge=decode_ge,
+                                    ge_text=decode_ge_text,
                                 ).detach()[0, 0, :]
 
                             audio_frag_end_idx.insert(0, 0)
@@ -1446,11 +1631,17 @@ class TTS:
                                     pred_semantic_list[i][-idx:].unsqueeze(0).unsqueeze(0)
                                 )  # .unsqueeze(0)#mq要多unsqueeze一次
                                 audio_fragment = self.vits_model.decode(
-                                        _pred_semantic, phones, refer_audio_spec, speed=speed_factor, sv_emb=sv_emb
+                                        _pred_semantic,
+                                        phones,
+                                        refer_audio_spec,
+                                        speed=speed_factor,
+                                        sv_emb=sv_emb,
+                                        ge=decode_ge,
+                                        ge_text=decode_ge_text,
                                     ).detach()[0, 0, :]
                                 batch_audio_fragment.append(audio_fragment)  ###试试重建不带上prompt部分
                     else:
-                        if parallel_infer:
+                        if vits_parallel_infer:
                             print(f"{i18n('并行合成中')}...")
                             audio_fragments = self.using_vocoder_synthesis_batched_infer(
                                 idx_list, pred_semantic_list, batch_phones, speed=speed_factor, sample_steps=sample_steps
@@ -1552,6 +1743,8 @@ class TTS:
                                                     phones, refer_audio_spec, 
                                                     speed=speed_factor,
                                                     sv_emb=sv_emb,
+                                                    ge=decode_ge,
+                                                    ge_text=decode_ge_text,
                                                     result_length=semantic_tokens.shape[-1]+overlap_len if not is_first_chunk else None,
                                                     overlap_frames=last_latent[:,:,-overlap_len*(2 if self.vits_model.semantic_frame_rate == "25hz" else 1):] \
                                                     if last_latent is not None else None,
@@ -1601,6 +1794,8 @@ class TTS:
                 if BENCH_CPU_ENABLED:
                     c5 = get_process_cpu_time_sec()
                     cpu_45 += c5 - c4
+                if rss_stats is not None:
+                    update_rss_peak("vits", batch_idx=batch_idx)
                 if return_fragment:
                     print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t4 - t3, t5 - t4))
                     yield self.audio_postprocess(
@@ -1623,6 +1818,8 @@ class TTS:
             if not (return_fragment or streaming_mode):
                 ref_prep_sec = t1 - t0
                 frontend_sec = t2 - t1
+                if rss_stats is not None:
+                    rss_stats["run_end_rss_bytes"] = update_rss_peak("run_end")
                 print("%.3f\t%.3f\t%.3f\t%.3f" % (ref_prep_sec, frontend_sec, t_34, t_45))
                 if BENCH_CPU_ENABLED:
                     ref_prep_cpu_time_sec = max(0.0, c1 - c0)
@@ -1661,6 +1858,42 @@ class TTS:
                                 "total_cpu_util_pct": round(
                                     calc_cpu_util_pct(total_cpu_time_sec, total_sec, cpu_count), 3
                                 ),
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                if rss_stats is not None:
+                    run_start_rss_bytes = int(rss_stats["run_start_rss_bytes"])
+                    ref_done_rss_bytes = int(rss_stats["ref_done_rss_bytes"])
+                    frontend_done_rss_bytes = int(rss_stats["frontend_done_rss_bytes"])
+                    infer_setup_done_rss_bytes = int(rss_stats["infer_setup_done_rss_bytes"])
+                    run_end_rss_bytes = int(rss_stats["run_end_rss_bytes"])
+                    peak_rss_bytes = int(rss_stats["peak_rss_bytes"])
+                    print(
+                        "GPTSOVITS_BENCH_RSS "
+                        + json.dumps(
+                            {
+                                "run_start_rss_mb": round(rss_bytes_to_mb(run_start_rss_bytes), 3),
+                                "ref_done_rss_mb": round(rss_bytes_to_mb(ref_done_rss_bytes), 3),
+                                "frontend_done_rss_mb": round(rss_bytes_to_mb(frontend_done_rss_bytes), 3),
+                                "infer_setup_done_rss_mb": round(rss_bytes_to_mb(infer_setup_done_rss_bytes), 3),
+                                "run_end_rss_mb": round(rss_bytes_to_mb(run_end_rss_bytes), 3),
+                                "peak_rss_mb": round(rss_bytes_to_mb(peak_rss_bytes), 3),
+                                "peak_stage": rss_stats["peak_stage"],
+                                "peak_batch_idx": rss_stats["peak_batch_idx"],
+                                "t2s_peak_rss_mb": round(rss_bytes_to_mb(int(rss_stats["t2s_peak_rss_bytes"])), 3),
+                                "t2s_peak_batch_idx": rss_stats["t2s_peak_batch_idx"],
+                                "vits_peak_rss_mb": round(rss_bytes_to_mb(int(rss_stats["vits_peak_rss_bytes"])), 3),
+                                "vits_peak_batch_idx": rss_stats["vits_peak_batch_idx"],
+                                "batch_count": rss_stats["batch_count"],
+                                "ref_delta_mb": round(rss_bytes_to_mb(ref_done_rss_bytes - run_start_rss_bytes), 3),
+                                "frontend_delta_mb": round(
+                                    rss_bytes_to_mb(frontend_done_rss_bytes - ref_done_rss_bytes), 3
+                                ),
+                                "infer_setup_delta_mb": round(
+                                    rss_bytes_to_mb(infer_setup_done_rss_bytes - frontend_done_rss_bytes), 3
+                                ),
+                                "end_delta_mb": round(rss_bytes_to_mb(run_end_rss_bytes - run_start_rss_bytes), 3),
                             },
                             ensure_ascii=False,
                         )
@@ -1931,6 +2164,66 @@ class TTS:
             audio_fragments.append(audio_fragment)
             audio = audio[feat_len * upsample_rate :]
 
+        return audio_fragments
+
+    def non_vocoder_synthesis_batched_infer(
+        self,
+        semantic_tokens_list: List[torch.Tensor],
+        batch_phones: List[torch.Tensor],
+        refer_audio_spec,
+        speed: float = 1.0,
+        sv_emb=None,
+        ge=None,
+        ge_text=None,
+    ) -> List[torch.Tensor]:
+        if not hasattr(self.vits_model, "prepare_decode_latent"):
+            raise RuntimeError("Current vits_model does not support prepare_decode_latent")
+
+        device = self.configs.device
+        code_lengths = torch.tensor(
+            [int(item.shape[0]) for item in semantic_tokens_list],
+            device=device,
+            dtype=torch.long,
+        )
+        text_lengths = torch.tensor(
+            [int(item.shape[0]) for item in batch_phones],
+            device=device,
+            dtype=torch.long,
+        )
+        max_code_len = int(code_lengths.max().item())
+        max_text_len = int(text_lengths.max().item())
+        batched_codes = torch.zeros((1, len(semantic_tokens_list), max_code_len), device=device, dtype=torch.long)
+        batched_text = torch.zeros((len(batch_phones), max_text_len), device=device, dtype=torch.long)
+
+        for idx, pred_semantic in enumerate(semantic_tokens_list):
+            cur_len = int(pred_semantic.shape[0])
+            batched_codes[0, idx, :cur_len] = pred_semantic.to(device=device, dtype=torch.long)
+        for idx, phones in enumerate(batch_phones):
+            cur_len = int(phones.shape[0])
+            batched_text[idx, :cur_len] = phones.to(device=device, dtype=torch.long)
+
+        z, y_mask, ge_batch, _, _, _ = self.vits_model.prepare_decode_latent(
+            batched_codes,
+            batched_text,
+            refer_audio_spec,
+            speed=speed,
+            sv_emb=sv_emb,
+            ge=ge,
+            ge_text=ge_text,
+            code_lengths=code_lengths,
+            text_lengths=text_lengths,
+            sequential_noise=True,
+        )
+        latent_lengths = y_mask.squeeze(1).sum(dim=1).round().to(dtype=torch.long)
+
+        audio_fragments = []
+        for idx in range(z.size(0)):
+            latent_len = int(latent_lengths[idx].item())
+            audio_fragment = self.vits_model.dec(
+                z[idx : idx + 1, :, :latent_len] * y_mask[idx : idx + 1, :, :latent_len],
+                g=ge_batch[idx : idx + 1],
+            ).detach()[0, 0, :]
+            audio_fragments.append(audio_fragment)
         return audio_fragments
 
     def sola_algorithm(

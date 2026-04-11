@@ -449,7 +449,25 @@ class en_G2p:
         words = simple_word_tokenize(text)
         tokens = ensure_pos_tag()(words) if self._needs_pos_tag(words) else [(word, "") for word in words]
         units = []
+        cursor = 0
         for o_word, pos in tokens:
+            char_start = text.find(o_word, cursor)
+            if char_start < 0:
+                raise RuntimeError(f"Failed to locate English token {o_word!r} from cursor={cursor} in text={text!r}")
+            if char_start > cursor:
+                gap_text = text[cursor:char_start]
+                gap_type = "space" if gap_text.isspace() else "punct"
+                units.append(
+                    {
+                        "unit_type": gap_type,
+                        "text": gap_text,
+                        "norm_text": gap_text,
+                        "phones": [],
+                        "char_start": int(cursor),
+                        "char_end": int(char_start),
+                    }
+                )
+            char_end = char_start + len(o_word)
             pron = self.pronounce_token(o_word, pos)
             unit_type = "punct" if re.search("[a-z]", o_word.lower()) is None else "word"
             units.append(
@@ -458,6 +476,23 @@ class en_G2p:
                     "text": o_word,
                     "norm_text": o_word.lower() if unit_type == "word" else o_word,
                     "phones": normalize_pronunciation(pron),
+                    "char_start": int(char_start),
+                    "char_end": int(char_end),
+                    "pos": pos,
+                }
+            )
+            cursor = char_end
+        if cursor < len(text):
+            gap_text = text[cursor:]
+            gap_type = "space" if gap_text.isspace() else "punct"
+            units.append(
+                {
+                    "unit_type": gap_type,
+                    "text": gap_text,
+                    "norm_text": gap_text,
+                    "phones": [],
+                    "char_start": int(cursor),
+                    "char_end": int(len(text)),
                 }
             )
         return finalize_phone_units(units)
