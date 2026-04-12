@@ -2226,12 +2226,13 @@ class TTS:
             sequential_noise=True,
         )
         latent_lengths = y_mask.squeeze(1).sum(dim=1).round().to(dtype=torch.long)
+        z.mul_(y_mask)
 
         audio_fragments = []
         for idx in range(z.size(0)):
             latent_len = int(latent_lengths[idx].item())
             audio_fragment = self.vits_model.dec(
-                z[idx : idx + 1, :, :latent_len] * y_mask[idx : idx + 1, :, :latent_len],
+                z[idx : idx + 1, :, :latent_len],
                 g=ge_batch[idx : idx + 1],
             ).detach()[0, 0, :]
             audio_fragments.append(audio_fragment)

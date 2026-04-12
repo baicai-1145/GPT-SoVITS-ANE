@@ -476,6 +476,7 @@ class Generator(torch.nn.Module):
     ):
         super(Generator, self).__init__()
         self.num_kernels = len(resblock_kernel_sizes)
+        self.num_kernels_inv = 1.0 / self.num_kernels
         self.num_upsamples = len(upsample_rates)
         self.conv_pre = Conv1d(initial_channel, upsample_initial_channel, 7, 1, padding=3)
         resblock = modules.ResBlock1 if resblock == "1" else modules.ResBlock2
@@ -554,21 +555,22 @@ class Generator(torch.nn.Module):
             if bench_enabled:
                 t_stage0 = time.perf_counter()
                 c_stage0 = time.process_time()
-            xs = None
+            resblock_offset = i * self.num_kernels
             block_wall_vals = []
             block_cpu_vals = []
             for j in range(self.num_kernels):
+                block = self.resblocks[resblock_offset + j]
                 if bench_enabled and VITS_GENERATOR_BENCH_DETAIL_ENABLED:
                     t_block0 = time.perf_counter()
                     c_block0 = time.process_time()
-                if xs is None:
-                    xs = self.resblocks[i * self.num_kernels + j](x)
+                if j == 0:
+                    xs = block(x)
                 else:
-                    xs += self.resblocks[i * self.num_kernels + j](x)
+                    xs.add_(block(x))
                 if bench_enabled and VITS_GENERATOR_BENCH_DETAIL_ENABLED:
                     block_wall_vals.append(time.perf_counter() - t_block0)
                     block_cpu_vals.append(time.process_time() - c_block0)
-            x = xs / self.num_kernels
+            x = xs.mul_(self.num_kernels_inv)
             if bench_enabled:
                 stage_wall = time.perf_counter() - t_stage0
                 stage_cpu = time.process_time() - c_stage0
