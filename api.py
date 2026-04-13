@@ -951,6 +951,7 @@ def get_tts_wav(
                 top_p=top_p,
                 temperature=temperature,
                 early_stop_num=hz * max_sec,
+                stable_batch_remap=T2S_STABLE_BATCH_REMAP,
             )
             pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
         t3 = ttime()
@@ -1201,6 +1202,7 @@ dict_language = {
     "auto": "auto",
     "auto_yue": "auto_yue",
 }
+T2S_STABLE_BATCH_REMAP = True
 
 # logger
 logging.config.dictConfig(uvicorn.config.LOGGING_CONFIG)

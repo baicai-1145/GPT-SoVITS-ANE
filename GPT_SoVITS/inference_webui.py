@@ -765,6 +765,7 @@ def audio_sr(audio, sr):
 ##ref_wav_path+prompt_text+prompt_language+text(单个)+text_language+top_k+top_p+temperature
 # cache_tokens={}#暂未实现清理机制
 cache = {}
+T2S_STABLE_BATCH_REMAP = True
 
 
 def get_tts_wav(
@@ -904,6 +905,7 @@ def get_tts_wav(
                     top_p=top_p,
                     temperature=temperature,
                     early_stop_num=hz * max_sec,
+                    stable_batch_remap=T2S_STABLE_BATCH_REMAP,
                 )
                 pred_semantic = pred_semantic[:, -idx:].unsqueeze(0)
                 cache[i_text] = pred_semantic
