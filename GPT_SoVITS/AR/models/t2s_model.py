@@ -175,6 +175,8 @@ class T2SBlock:
         self.qkv_out_dim: int = qkv_b.shape[0]
         self.out_w = out_w
         self.out_b = out_b
+        self.out_w_t = out_w.transpose(0, 1).contiguous()
+        self.out_out_dim: int = out_b.shape[0]
         self.norm_w1 = norm_w1
         self.norm_b1 = norm_b1
         self.norm_eps1 = norm_eps1
@@ -233,7 +235,13 @@ class T2SBlock:
             attn = scaled_dot_product_attention(q, k, v, attn_mask)
 
         attn = attn.transpose(1, 2).reshape(batch_size, q_len, -1)
-        attn = F.linear(self.to_mask(attn, padding_mask), self.out_w, self.out_b)
+        attn_masked = self.to_mask(attn, padding_mask)
+        out_rows = batch_size * q_len
+        if out_rows == 1:
+            attn = F.linear(attn_masked.reshape(out_rows, attn_masked.shape[2]), self.out_w, self.out_b)
+        else:
+            attn = torch.addmm(self.out_b, attn_masked.reshape(out_rows, attn_masked.shape[2]), self.out_w_t)
+        attn = attn.view(batch_size, q_len, self.out_out_dim)
 
         x = x + attn
         x = F.layer_norm(x, [self.hidden_dim], self.norm_w1, self.norm_b1, self.norm_eps1)
@@ -289,7 +297,12 @@ class T2SBlock:
             attn = scaled_dot_product_attention(q, k, v, attn_mask)
 
         attn = attn.transpose(1, 2).reshape(batch_size, q_len, -1)
-        attn = F.linear(attn, self.out_w, self.out_b)
+        out_rows = batch_size * q_len
+        if out_rows == 1:
+            attn = F.linear(attn.reshape(out_rows, attn.shape[2]), self.out_w, self.out_b)
+        else:
+            attn = torch.addmm(self.out_b, attn.reshape(out_rows, attn.shape[2]), self.out_w_t)
+        attn = attn.view(batch_size, q_len, self.out_out_dim)
 
         x = x + attn
         x = F.layer_norm(
