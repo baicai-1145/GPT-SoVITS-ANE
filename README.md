@@ -43,13 +43,13 @@ conda activate GPTSoVits
 CPU example with ModelScope and `v2ProPlus`:
 
 ```bash
-bash install.sh --device CPU --source ModelScope --version v2ProPlus
+bash install.sh --source ModelScope --version v2ProPlus
 ```
 
 Windows PowerShell:
 
 ```powershell
-.\install.ps1 -Device CPU -Source ModelScope -Version v2ProPlus
+.\install.ps1 -Source ModelScope -Version v2ProPlus
 ```
 
 Available versions:
@@ -86,7 +86,7 @@ python GPT_SoVITS/inference_webui_fast.py
 
 - This fork is aimed at CPU inference, not training.
 - Chinese inference is still heavier than English / Japanese / Korean because text preprocessing needs extra frontend work such as `g2pw` and BERT features.
-- `install.sh` and `install.ps1` now download inference assets by version instead of the full pretrained bundle.
+- `install.sh` and `install.ps1` are now CPU-only installers and download inference assets by version instead of the full pretrained bundle.
 - `NLTK` and `OpenJTalk` dictionary downloads remain enabled by default.
 
 ## Speed Summary

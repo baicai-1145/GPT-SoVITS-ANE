@@ -1,5 +1,4 @@
 Param (
-    [Parameter(Mandatory=$true)][ValidateSet("CU126", "CU128", "CPU")][string]$Device,
     [Parameter(Mandatory=$true)][ValidateSet("HF", "HF-Mirror", "ModelScope")][string]$Source,
     [Parameter(Mandatory=$true)][ValidateSet("v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus", "all")][string]$Version
 )
@@ -272,20 +271,8 @@ if (-not (Test-Path "GPT_SoVITS/text/G2PWModel")) {
     Write-Info "Skip Downloading G2PWModel"
 }
 
-switch ($Device) {
-    "CU128" {
-        Write-Info "Installing PyTorch For CUDA 12.8..."
-        Invoke-Pip torch --index-url "https://download.pytorch.org/whl/cu128"
-    }
-    "CU126" {
-        Write-Info "Installing PyTorch For CUDA 12.6..."
-        Invoke-Pip torch --index-url "https://download.pytorch.org/whl/cu126"
-    }
-    "CPU" {
-        Write-Info "Installing PyTorch For CPU..."
-        Invoke-Pip torch --index-url "https://download.pytorch.org/whl/cpu"
-    }
-}
+Write-Info "Installing PyTorch For CPU..."
+Invoke-Pip torch --index-url "https://download.pytorch.org/whl/cpu"
 Write-Success "PyTorch Installed"
 
 Write-Info "Installing Python Dependencies From requirements.txt..."

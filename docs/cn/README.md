@@ -41,13 +41,13 @@ conda activate GPTSoVits
 CPU + ModelScope + `v2ProPlus` 示例：
 
 ```bash
-bash install.sh --device CPU --source ModelScope --version v2ProPlus
+bash install.sh --source ModelScope --version v2ProPlus
 ```
 
 Windows PowerShell：
 
 ```powershell
-.\install.ps1 -Device CPU -Source ModelScope -Version v2ProPlus
+.\install.ps1 -Source ModelScope -Version v2ProPlus
 ```
 
 可选版本：
@@ -84,7 +84,7 @@ python GPT_SoVITS/inference_webui_fast.py
 
 - 这个分支的目标是推理，不再支持训练工作流。
 - 中文推理前处理仍然比英 / 日 / 韩更重，因为需要额外做 `g2pw` 和 BERT 文本特征。
-- `install.sh` 和 `install.ps1` 已改为按版本下载推理资源，不再整包下载全部预训练文件。
+- `install.sh` 和 `install.ps1` 现在只安装 CPU 版依赖，并按版本下载推理资源，不再整包下载全部预训练文件。
 - `NLTK` 与 `OpenJTalk` 字典默认仍会下载。
 
 ## 速度摘要

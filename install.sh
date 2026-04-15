@@ -58,9 +58,6 @@ run_wget_quiet() {
     fi
 }
 
-USE_CUDA=false
-USE_ROCM=false
-USE_CPU=false
 WORKFLOW=${WORKFLOW:-"false"}
 MODEL_VERSION=""
 
@@ -72,15 +69,14 @@ print_help() {
     echo "Usage: bash install.sh [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --device   CU126|CU128|ROCM|MPS|CPU    Specify the Device (REQUIRED)"
     echo "  --source   HF|HF-Mirror|ModelScope     Specify the model source (REQUIRED)"
     echo "  --version  v1|v2|v3|v4|v2Pro|v2ProPlus|all"
     echo "                                            Specify which inference pretrained files to download (REQUIRED)"
     echo "  -h, --help                             Show this help message and exit"
     echo ""
     echo "Examples:"
-    echo "  bash install.sh --device CU128 --source HF --version v2Pro"
-    echo "  bash install.sh --device MPS --source ModelScope --version all"
+    echo "  bash install.sh --source HF --version v2Pro"
+    echo "  bash install.sh --source ModelScope --version all"
 }
 
 # Show help if no arguments provided
@@ -111,33 +107,6 @@ while [[ $# -gt 0 ]]; do
         esac
         shift 2
         ;;
-    --device)
-        case "$2" in
-        CU126)
-            CUDA=126
-            USE_CUDA=true
-            ;;
-        CU128)
-            CUDA=128
-            USE_CUDA=true
-            ;;
-        ROCM)
-            USE_ROCM=true
-            ;;
-        MPS)
-            USE_CPU=true
-            ;;
-        CPU)
-            USE_CPU=true
-            ;;
-        *)
-            echo -e "${ERROR}Error: Invalid Device: $2"
-            echo -e "${ERROR}Choose From: [CU126, CU128, ROCM, MPS, CPU]"
-            exit 1
-            ;;
-        esac
-        shift 2
-        ;;
     --version)
         case "$2" in
         v1 | v2 | v3 | v4 | v2Pro | v2ProPlus | all)
@@ -156,20 +125,17 @@ while [[ $# -gt 0 ]]; do
         exit 0
         ;;
     *)
-        echo -e "${ERROR}Unknown Argument: $1"
+        if [[ "$1" == "--device" ]]; then
+            echo -e "${ERROR}Error: --device is no longer supported. This installer now installs CPU-only dependencies."
+        else
+            echo -e "${ERROR}Unknown Argument: $1"
+        fi
         echo ""
         print_help
         exit 1
         ;;
     esac
 done
-
-if ! $USE_CUDA && ! $USE_ROCM && ! $USE_CPU; then
-    echo -e "${ERROR}Error: Device is REQUIRED"
-    echo ""
-    print_help
-    exit 1
-fi
 
 if ! $USE_HF && ! $USE_HF_MIRROR && ! $USE_MODELSCOPE; then
     echo -e "${ERROR}Error: Download Source is REQUIRED"
@@ -362,51 +328,9 @@ else
     echo -e "${INFO}Skip Downloading G2PWModel"
 fi
 
-if [ "$USE_CUDA" = true ] && [ "$WORKFLOW" = false ]; then
-    echo -e "${INFO}Checking For Nvidia Driver Installation..."
-    if command -v nvidia-smi &>/dev/null; then
-        echo "${INFO}Nvidia Driver Founded"
-    else
-        echo -e "${WARNING}Nvidia Driver Not Found, Fallback to CPU"
-        USE_CUDA=false
-        USE_CPU=true
-    fi
-fi
-
-if [ "$USE_ROCM" = true ] && [ "$WORKFLOW" = false ]; then
-    echo -e "${INFO}Checking For ROCm Installation..."
-    if [ -d "/opt/rocm" ]; then
-        echo -e "${INFO}ROCm Founded"
-        if grep -qi "microsoft" /proc/version; then
-            echo -e "${INFO}WSL2 Founded"
-            IS_WSL=true
-        else
-            IS_WSL=false
-        fi
-    else
-        echo -e "${WARNING}ROCm Not Found, Fallback to CPU"
-        USE_ROCM=false
-        USE_CPU=true
-    fi
-fi
-
-if [ "$USE_CUDA" = true ] && [ "$WORKFLOW" = false ]; then
-    if [ "$CUDA" = 128 ]; then
-        echo -e "${INFO}Installing PyTorch For CUDA 12.8..."
-        run_pip_quiet torch --index-url "https://download.pytorch.org/whl/cu128"
-    elif [ "$CUDA" = 126 ]; then
-        echo -e "${INFO}Installing PyTorch For CUDA 12.6..."
-        run_pip_quiet torch --index-url "https://download.pytorch.org/whl/cu126"
-    fi
-elif [ "$USE_ROCM" = true ] && [ "$WORKFLOW" = false ]; then
-    echo -e "${INFO}Installing PyTorch For ROCm 6.2..."
-    run_pip_quiet torch --index-url "https://download.pytorch.org/whl/rocm6.2"
-elif [ "$USE_CPU" = true ] && [ "$WORKFLOW" = false ]; then
+if [ "$WORKFLOW" = false ]; then
     echo -e "${INFO}Installing PyTorch For CPU..."
     run_pip_quiet torch --index-url "https://download.pytorch.org/whl/cpu"
-elif [ "$WORKFLOW" = false ]; then
-    echo -e "${ERROR}Unknown Err"
-    exit 1
 fi
 echo -e "${SUCCESS}PyTorch Installed"
 
@@ -434,14 +358,5 @@ run_wget_quiet "$PYOPENJTALK_URL" -O open_jtalk_dic_utf_8-1.11.tar.gz
 tar -xzf open_jtalk_dic_utf_8-1.11.tar.gz -C "$PYOPENJTALK_PREFIX"
 rm -rf open_jtalk_dic_utf_8-1.11.tar.gz
 echo -e "${SUCCESS}Open JTalk Dic Downloaded"
-
-if [ "$USE_ROCM" = true ] && [ "$IS_WSL" = true ]; then
-    echo -e "${INFO}Updating WSL Compatible Runtime Lib For ROCm..."
-    location=$(pip show torch | grep Location | awk -F ": " '{print $2}')
-    cd "${location}"/torch/lib/ || exit
-    rm libhsa-runtime64.so*
-    cp "$(readlink -f /opt/rocm/lib/libhsa-runtime64.so)" libhsa-runtime64.so
-    echo -e "${SUCCESS}ROCm Runtime Lib Updated..."
-fi
 
 echo -e "${SUCCESS}Installation Completed"
