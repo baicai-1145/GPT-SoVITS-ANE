@@ -54,13 +54,22 @@ try:
                 hash_md5.update(chunk)
         return hash_md5.hexdigest()
 
-    USERDIC_CSV_PATH = os.path.join(current_file_path, "ja_userdic", "userdict.csv")
-    USERDIC_BIN_PATH = os.path.join(current_file_path, "ja_userdic", "user.dict")
-    USERDIC_HASH_PATH = os.path.join(current_file_path, "ja_userdic", "userdict.md5")
+    user_dictionary_root = os.environ.get("GPTSOVITS_JA_USER_DIC_DIR")
+    if user_dictionary_root:
+        user_dictionary_root = os.path.abspath(user_dictionary_root)
+        if not os.path.isdir(user_dictionary_root):
+            raise FileNotFoundError(f"Japanese user dictionary directory does not exist: {user_dictionary_root}")
+    else:
+        user_dictionary_root = os.path.join(current_file_path, "ja_userdic")
+
+    USERDIC_CSV_PATH = os.path.join(user_dictionary_root, "userdict.csv")
+    USERDIC_BIN_PATH = os.path.join(user_dictionary_root, "user.dict")
+    USERDIC_HASH_PATH = os.path.join(user_dictionary_root, "userdict.md5")
     # 如果没有用户词典，就生成一个；如果有，就检查md5，如果不一样，就重新生成
     if os.path.exists(USERDIC_CSV_PATH):
         if (
             not os.path.exists(USERDIC_BIN_PATH)
+            or not os.path.exists(USERDIC_HASH_PATH)
             or get_hash(USERDIC_CSV_PATH) != open(USERDIC_HASH_PATH, "r", encoding="utf-8").read()
         ):
             pyopenjtalk.mecab_dict_index(USERDIC_CSV_PATH, USERDIC_BIN_PATH)

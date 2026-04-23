@@ -39,8 +39,15 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from module.distrib import broadcast_tensors, is_distributed
-from module.ddp_utils import SyncFunction
+try:
+    from module.distrib import broadcast_tensors, is_distributed
+    from module.ddp_utils import SyncFunction
+except ImportError:
+    def broadcast_tensors(tensors, src=0):
+        return tensors
+    def is_distributed():
+        return False
+    SyncFunction = None
 from tqdm import tqdm
 
 

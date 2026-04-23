@@ -13,6 +13,22 @@ import os
 from text.phone_units import finalize_phone_units, flatten_phone_units
 
 
+def _configure_mecab_dictionary_override():
+    override = os.environ.get("GPTSOVITS_MECAB_KO_DIC_DIR")
+    if not override:
+        return None
+    override = os.path.abspath(override)
+    if not os.path.isdir(override):
+        raise FileNotFoundError(f"Korean mecab dictionary directory does not exist: {override}")
+    try:
+        import mecab_ko_dic
+
+        mecab_ko_dic.dictionary_path = override
+    except Exception:
+        pass
+    return override
+
+
 class _LazyCmuDict:
     def __init__(self):
         self._cmu = None
@@ -89,6 +105,7 @@ def _cleanup_lazy_nltk_stub(installed_names):
 
 _stubbed_nltk_modules = _install_lazy_nltk_stub()
 try:
+    _configure_mecab_dictionary_override()
     from g2pk2 import G2p
 finally:
     _cleanup_lazy_nltk_stub(_stubbed_nltk_modules)
