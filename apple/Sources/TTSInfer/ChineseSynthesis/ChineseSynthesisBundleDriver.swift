@@ -95,13 +95,16 @@ public final class GPTSoVITSChineseSynthesisBundleDriver {
     public let bundleDirectory: URL
     public let manifest: GPTSoVITSChineseSynthesisBundleManifest
     public let pipeline: GPTSoVITSChineseSynthesisPipeline
+    public let promptBundleDirectory: URL?
     public let englishFrontendBundleDirectory: URL?
     public let yueFrontendBundleDirectory: URL?
     public let japaneseFrontendBundleDirectory: URL?
     public let koreanFrontendBundleDirectory: URL?
+    private let modelConfiguration: MLModelConfiguration
 
     public init(bundleDirectory: URL, configuration: MLModelConfiguration = MLModelConfiguration()) throws {
         self.bundleDirectory = bundleDirectory
+        self.modelConfiguration = configuration
         let manifestURL = bundleDirectory.appendingPathComponent("manifest.json")
         let manifestData = try GPTSoVITSRuntimeProfiler.measure("bundle_driver.manifest.read") {
             try Data(contentsOf: manifestURL)
@@ -144,6 +147,7 @@ public final class GPTSoVITSChineseSynthesisBundleDriver {
         self.yueFrontendBundleDirectory = resolvedArtifacts.yueFrontendBundleDirectory
         self.japaneseFrontendBundleDirectory = resolvedArtifacts.japaneseFrontendBundleDirectory
         self.koreanFrontendBundleDirectory = resolvedArtifacts.koreanFrontendBundleDirectory
+        self.promptBundleDirectory = resolvedArtifacts.promptBundleURL
 
         if let promptBundleURL = resolvedArtifacts.promptBundleURL {
             self.pipeline = try GPTSoVITSRuntimeProfiler.measure("bundle_driver.pipeline.init") {
@@ -169,6 +173,66 @@ public final class GPTSoVITSChineseSynthesisBundleDriver {
                 )
             }
         }
+    }
+
+    public func synthesize(
+        prompts: [Int32],
+        promptText: String,
+        targetText: String,
+        referenceAudio: ReferenceAudioSamples,
+        language: GPTSoVITSTextLanguage = .zh,
+        splitMethod: GPTSoVITSTextSplitMethod = .cut5,
+        noiseScale: Float? = nil,
+        seed: UInt64? = nil
+    ) throws -> GPTSoVITSChineseSynthesisResult {
+        try pipeline.resolveDefaultTextPhoneBackend(
+            for: language,
+            englishFrontendBundleDirectory: englishFrontendBundleDirectory,
+            yueFrontendBundleDirectory: yueFrontendBundleDirectory,
+            japaneseFrontendBundleDirectory: japaneseFrontendBundleDirectory,
+            koreanFrontendBundleDirectory: koreanFrontendBundleDirectory
+        )
+        return try pipeline.synthesize(
+            prompts: prompts,
+            promptText: promptText,
+            targetText: targetText,
+            referenceAudio: referenceAudio,
+            language: language,
+            splitMethod: splitMethod,
+            noiseScale: noiseScale,
+            seed: seed
+        )
+    }
+
+    public func synthesizeCrossLingual(
+        prompts: [Int32],
+        promptText: String,
+        targetText: String,
+        promptLanguage: GPTSoVITSTextLanguage,
+        targetLanguage: GPTSoVITSTextLanguage,
+        referenceAudio: ReferenceAudioSamples,
+        splitMethod: GPTSoVITSTextSplitMethod = .cut5,
+        noiseScale: Float? = nil,
+        seed: UInt64? = nil
+    ) throws -> GPTSoVITSChineseSynthesisResult {
+        try resolveTextPhoneBackend(for: promptLanguage)
+        let preparedPrompt = try pipeline.textPreparer.preparePromptText(promptText, language: promptLanguage)
+        try resolveTextPhoneBackend(for: targetLanguage)
+        let preparedTargets = try pipeline.textPreparer.prepareTargetSegments(
+            text: targetText,
+            language: targetLanguage,
+            splitMethod: splitMethod
+        )
+        let conditioning = try pipeline.speakerConditioned.vits.prepareReferenceConditioning(referenceAudio: referenceAudio)
+        return try synthesizePreparedCrossLingual(
+            prompts: prompts,
+            promptLength: prompts.count,
+            preparedPrompt: preparedPrompt,
+            preparedTargets: preparedTargets,
+            conditioning: conditioning,
+            noiseScale: noiseScale,
+            seed: seed
+        )
     }
 
     public func synthesize(
@@ -205,6 +269,56 @@ public final class GPTSoVITSChineseSynthesisBundleDriver {
     public func synthesize(
         promptText: String,
         targetText: String,
+        referenceAudio: ReferenceAudioSamples,
+        language: GPTSoVITSTextLanguage = .zh,
+        splitMethod: GPTSoVITSTextSplitMethod = .cut5,
+        noiseScale: Float? = nil,
+        seed: UInt64? = nil
+    ) throws -> GPTSoVITSChineseSynthesisResult {
+        try pipeline.resolveDefaultTextPhoneBackend(
+            for: language,
+            englishFrontendBundleDirectory: englishFrontendBundleDirectory,
+            yueFrontendBundleDirectory: yueFrontendBundleDirectory,
+            japaneseFrontendBundleDirectory: japaneseFrontendBundleDirectory,
+            koreanFrontendBundleDirectory: koreanFrontendBundleDirectory
+        )
+        return try pipeline.synthesize(
+            promptText: promptText,
+            targetText: targetText,
+            referenceAudio: referenceAudio,
+            language: language,
+            splitMethod: splitMethod,
+            noiseScale: noiseScale,
+            seed: seed
+        )
+    }
+
+    public func synthesizeCrossLingual(
+        promptText: String,
+        targetText: String,
+        promptLanguage: GPTSoVITSTextLanguage,
+        targetLanguage: GPTSoVITSTextLanguage,
+        referenceAudio: ReferenceAudioSamples,
+        splitMethod: GPTSoVITSTextSplitMethod = .cut5,
+        noiseScale: Float? = nil,
+        seed: UInt64? = nil
+    ) throws -> GPTSoVITSChineseSynthesisResult {
+        try synthesizeCrossLingual(
+            promptText: promptText,
+            targetText: targetText,
+            promptLanguage: promptLanguage,
+            targetLanguage: targetLanguage,
+            promptReferenceAudio: referenceAudio,
+            conditioningReferenceAudio: referenceAudio,
+            splitMethod: splitMethod,
+            noiseScale: noiseScale,
+            seed: seed
+        )
+    }
+
+    public func synthesize(
+        promptText: String,
+        targetText: String,
         referenceAudioChannels: [[Float]],
         referenceAudioSampleRate: Int,
         language: GPTSoVITSTextLanguage = .zh,
@@ -228,6 +342,168 @@ public final class GPTSoVITSChineseSynthesisBundleDriver {
             splitMethod: splitMethod,
             noiseScale: noiseScale,
             seed: seed
+        )
+    }
+
+    public func synthesize(
+        promptText: String,
+        targetText: String,
+        promptReferenceAudio: ReferenceAudioSamples,
+        conditioningReferenceAudio: ReferenceAudioSamples,
+        language: GPTSoVITSTextLanguage = .zh,
+        splitMethod: GPTSoVITSTextSplitMethod = .cut5,
+        noiseScale: Float? = nil,
+        seed: UInt64? = nil
+    ) throws -> GPTSoVITSChineseSynthesisResult {
+        try pipeline.resolveDefaultTextPhoneBackend(
+            for: language,
+            englishFrontendBundleDirectory: englishFrontendBundleDirectory,
+            yueFrontendBundleDirectory: yueFrontendBundleDirectory,
+            japaneseFrontendBundleDirectory: japaneseFrontendBundleDirectory,
+            koreanFrontendBundleDirectory: koreanFrontendBundleDirectory
+        )
+        return try pipeline.synthesize(
+            promptText: promptText,
+            targetText: targetText,
+            promptReferenceAudio: promptReferenceAudio,
+            conditioningReferenceAudio: conditioningReferenceAudio,
+            language: language,
+            splitMethod: splitMethod,
+            noiseScale: noiseScale,
+            seed: seed
+        )
+    }
+
+    public func synthesizeCrossLingual(
+        promptText: String,
+        targetText: String,
+        promptLanguage: GPTSoVITSTextLanguage,
+        targetLanguage: GPTSoVITSTextLanguage,
+        promptReferenceAudio: ReferenceAudioSamples,
+        conditioningReferenceAudio: ReferenceAudioSamples,
+        splitMethod: GPTSoVITSTextSplitMethod = .cut5,
+        noiseScale: Float? = nil,
+        seed: UInt64? = nil
+    ) throws -> GPTSoVITSChineseSynthesisResult {
+        let promptSemantic = try makePromptSemanticPipeline()
+        let promptResult = try promptSemantic.extractPrompts(referenceAudio: promptReferenceAudio)
+        try resolveTextPhoneBackend(for: promptLanguage)
+        let preparedPrompt = try pipeline.textPreparer.preparePromptText(promptText, language: promptLanguage)
+        try resolveTextPhoneBackend(for: targetLanguage)
+        let preparedTargets = try pipeline.textPreparer.prepareTargetSegments(
+            text: targetText,
+            language: targetLanguage,
+            splitMethod: splitMethod
+        )
+        let conditioning = try pipeline.speakerConditioned.vits.prepareReferenceConditioning(
+            referenceAudio: conditioningReferenceAudio
+        )
+        let synthesized = try synthesizePreparedCrossLingual(
+            prompts: promptResult.prompts,
+            promptLength: promptResult.promptCount,
+            preparedPrompt: preparedPrompt,
+            preparedTargets: preparedTargets,
+            conditioning: conditioning,
+            noiseScale: noiseScale,
+            seed: seed
+        )
+        return GPTSoVITSChineseSynthesisResult(
+            prompts: synthesized.prompts,
+            promptExtraction: promptResult,
+            prompt: synthesized.prompt,
+            segments: synthesized.segments
+        )
+    }
+
+    private func resolveTextPhoneBackend(
+        for language: GPTSoVITSTextLanguage
+    ) throws {
+        try pipeline.resolveDefaultTextPhoneBackend(
+            for: language,
+            englishFrontendBundleDirectory: englishFrontendBundleDirectory,
+            yueFrontendBundleDirectory: yueFrontendBundleDirectory,
+            japaneseFrontendBundleDirectory: japaneseFrontendBundleDirectory,
+            koreanFrontendBundleDirectory: koreanFrontendBundleDirectory
+        )
+    }
+
+    private func makePromptSemanticPipeline() throws -> GPTSoVITSPromptSemanticPipeline {
+        if let promptSemantic = pipeline.promptSemantic {
+            return promptSemantic
+        }
+        guard let promptBundleDirectory else {
+            throw GPTSoVITSChineseSynthesisPipelineError.promptConditioningUnavailable
+        }
+        return try GPTSoVITSPromptSemanticPipeline(
+            bundleDirectory: promptBundleDirectory,
+            configuration: modelConfiguration
+        )
+    }
+
+    private func synthesizePreparedCrossLingual(
+        prompts: [Int32],
+        promptLength: Int,
+        preparedPrompt: GPTSoVITST2SPreparedTextInput,
+        preparedTargets: [GPTSoVITST2SPreparedSegment],
+        conditioning: PreparedReferenceConditioning,
+        noiseScale: Float?,
+        seed: UInt64?
+    ) throws -> GPTSoVITSChineseSynthesisResult {
+        let promptsArray = try pipeline.speakerConditioned.t2s.makeInt32Array(
+            shape: [1, max(prompts.count, 1)],
+            values: prompts + Array(repeating: 0, count: max(0, max(prompts.count, 1) - prompts.count))
+        )
+        let usesDynamicPrompts = pipeline.speakerConditioned.t2s.manifest.runtime.shapes?.promptLenRange != nil
+        let resolvedPromptsArray = usesDynamicPrompts
+            ? promptsArray
+            : try pipeline.speakerConditioned.t2s.makeInt32Array(
+                shape: pipeline.speakerConditioned.t2s.prefillModel.modelDescription
+                    .inputDescriptionsByName["prompts"]?
+                    .multiArrayConstraint?
+                    .shape
+                    .map { Int(truncating: $0) } ?? [1, prompts.count],
+                values: prompts + Array(
+                    repeating: 0,
+                    count: max(
+                        0,
+                        (pipeline.speakerConditioned.t2s.prefillModel.modelDescription
+                            .inputDescriptionsByName["prompts"]?
+                            .multiArrayConstraint?
+                            .shape
+                            .last
+                            .map { Int(truncating: $0) } ?? prompts.count) - prompts.count
+                    )
+                )
+            )
+        let t2sSamplingRNGBox = seed.map(T2SSamplingRNGBox.init(seed:))
+        let synthesizedSegments = try preparedTargets.map { segment in
+            let vitsText = try pipeline.speakerConditioned.makePaddedVITSText(phoneIDs: segment.input.phoneIDs)
+            return GPTSoVITSChineseSynthesisSegmentResult(
+                preparedSegment: segment,
+                synthesis: try pipeline.speakerConditioned.synthesize(
+                    prompts: resolvedPromptsArray,
+                    promptLength: promptLength,
+                    refSeq: preparedPrompt.seq,
+                    refSeqLength: preparedPrompt.phoneCount,
+                    textSeq: segment.input.seq,
+                    textSeqLength: segment.input.phoneCount,
+                    refBert: preparedPrompt.bert,
+                    textBert: segment.input.bert,
+                    vitsText: vitsText,
+                    vitsTextLength: segment.input.phoneIDs.count,
+                    refer: conditioning.refer,
+                    speakerFbank80: conditioning.speakerFbank80,
+                    noiseScale: noiseScale,
+                    seed: seed,
+                    samplingRNGBox: t2sSamplingRNGBox
+                )
+            )
+        }
+        return GPTSoVITSChineseSynthesisResult(
+            prompts: prompts,
+            promptExtraction: nil,
+            prompt: preparedPrompt,
+            segments: synthesizedSegments
         )
     }
 
