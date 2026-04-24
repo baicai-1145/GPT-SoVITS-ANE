@@ -58,21 +58,22 @@ class EnglishOOVPredictor(torch.nn.Module):
         rzn_ih = torch.matmul(x, w_ih.transpose(0, 1)) + b_ih
         rzn_hh = torch.matmul(h, w_hh.transpose(0, 1)) + b_hh
 
-        split = rzn_ih.shape[-1] * 2 // 3
+        split = rzn_ih.size(-1) * 2 // 3
         rz_ih, n_ih = rzn_ih[:, :split], rzn_ih[:, split:]
         rz_hh, n_hh = rzn_hh[:, :split], rzn_hh[:, split:]
 
         rz = self._sigmoid(rz_ih + rz_hh)
-        half = rz.shape[-1] // 2
+        half = rz.size(-1) // 2
         r, z = rz[:, :half], rz[:, half:]
 
         n = torch.tanh(n_ih + r * n_hh)
         return (1.0 - z) * n + z * h
 
     def forward(self, input_ids: torch.Tensor, input_length: torch.Tensor) -> torch.Tensor:
-        batch_size, steps = input_ids.shape
+        batch_size = input_ids.size(0)
+        steps = input_ids.size(1)
         x = self.enc_emb[input_ids.to(dtype=torch.long)]
-        hidden_size = self.enc_w_hh.shape[1]
+        hidden_size = self.enc_w_hh.size(1)
         h = torch.zeros((batch_size, hidden_size), dtype=torch.float32, device=input_ids.device)
         outputs = torch.zeros((batch_size, steps, hidden_size), dtype=torch.float32, device=input_ids.device)
 
@@ -185,6 +186,13 @@ def _build_runtime_assets(graphemes: List[str], phonemes: List[str]) -> Dict:
             "normalization_mode": "apple_english_subset_matching_python_gsv",
             "oov_predictor": "g2p_en_checkpoint20_gru",
         },
+    }
+
+
+def _shape_range(lower_bound: int, upper_bound: int) -> Dict:
+    return {
+        "lower_bound": int(lower_bound),
+        "upper_bound": int(upper_bound),
     }
 
 
@@ -303,6 +311,16 @@ def main():
             "shapes": {
                 "max_word_len": int(args.max_word_len),
                 "max_decode_len": int(args.max_decode_len),
+            },
+            "capacity_contract": {
+                "python_behavior": {
+                    "scope": "single_oov_word_predictor_only",
+                    "sentence_length": "handled_by_host_text_frontend_not_by_max_word_len",
+                },
+                "current_export": {
+                    "single_word_max_len": int(args.max_word_len),
+                    "max_decode_len": int(args.max_decode_len),
+                },
             },
             "coreml": {
                 "compute_units": args.coreml_compute_units,

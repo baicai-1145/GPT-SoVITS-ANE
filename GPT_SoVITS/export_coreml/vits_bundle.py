@@ -77,8 +77,14 @@ def _parse_precision_overrides(raw_value: str | None, allowed_artifacts: set[str
 def _shape_range(lower_bound: int, upper_bound: int) -> Dict:
     return {
         "lower_bound": int(lower_bound),
-        "upper_bound": int(max(lower_bound, upper_bound)),
+        "upper_bound": int(upper_bound),
     }
+
+
+def _resolve_input_types_override(shape_mode: str, builder, *builder_args):
+    if shape_mode == "fixed":
+        return None
+    return builder(*builder_args)
 
 
 def _build_decode_condition_inputs(model, args):
@@ -125,6 +131,21 @@ def _build_prior_inputs(model, args):
     )
 
 
+def _build_prior_input_types(model, args):
+    import coremltools as ct
+
+    ge_text_channels = getattr(getattr(model, "ge_to512", None), "out_features", model.gin_channels)
+    semantic_frames = ct.RangeDim(lower_bound=1, upper_bound=int(args.vits_code_len), symbol="semantic_frames")
+    text_phone_count = ct.RangeDim(lower_bound=1, upper_bound=int(args.vits_text_len), symbol="text_phone_count")
+    return [
+        ct.TensorType(name="codes", shape=(1, 1, semantic_frames), dtype=np.int32),
+        ct.TensorType(name="text", shape=(1, text_phone_count), dtype=np.int32),
+        ct.TensorType(name="ge_text", shape=(1, int(ge_text_channels), 1), dtype=np.float32),
+        ct.TensorType(name="code_lengths", shape=(1,), dtype=np.int32),
+        ct.TensorType(name="text_lengths", shape=(1,), dtype=np.int32),
+    ]
+
+
 def _build_flow_inputs(model, args):
     latent_channels = model.enc_p.out_channels
     return (
@@ -132,6 +153,18 @@ def _build_flow_inputs(model, args):
         torch.ones((1, 1, args.vits_latent_len), dtype=torch.float32, device=args.device),
         torch.zeros((1, model.gin_channels, 1), dtype=torch.float32, device=args.device),
     )
+
+
+def _build_latent_like_input_types(model, args, latent_name: str):
+    import coremltools as ct
+
+    latent_channels = int(model.enc_p.out_channels)
+    latent_frames = ct.RangeDim(lower_bound=1, upper_bound=int(args.vits_latent_len), symbol="latent_frames")
+    return [
+        ct.TensorType(name=latent_name, shape=(1, latent_channels, latent_frames), dtype=np.float32),
+        ct.TensorType(name="y_mask", shape=(1, 1, latent_frames), dtype=np.float32),
+        ct.TensorType(name="ge", shape=(1, int(model.gin_channels), 1), dtype=np.float32),
+    ]
 
 
 def _build_wave_inputs(model, args):
@@ -159,6 +192,19 @@ def _build_latent_sampler_inputs(model, args):
         torch.zeros((1, latent_channels, args.vits_latent_len), dtype=torch.float32, device=args.device),
         torch.tensor([args.noise_scale], dtype=torch.float32, device=args.device),
     )
+
+
+def _build_latent_sampler_input_types(model, args):
+    import coremltools as ct
+
+    latent_channels = int(model.enc_p.out_channels)
+    latent_frames = ct.RangeDim(lower_bound=1, upper_bound=int(args.vits_latent_len), symbol="latent_frames")
+    return [
+        ct.TensorType(name="prior_mean", shape=(1, latent_channels, latent_frames), dtype=np.float32),
+        ct.TensorType(name="prior_log_scale", shape=(1, latent_channels, latent_frames), dtype=np.float32),
+        ct.TensorType(name="noise", shape=(1, latent_channels, latent_frames), dtype=np.float32),
+        ct.TensorType(name="noise_scale", shape=(1,), dtype=np.float32),
+    ]
 
 
 def _build_speaker_encoder_target(args):
@@ -261,9 +307,13 @@ def _build_reference_audio_contract(
     vits_data_config: Dict,
     speaker_fbank_shape,
     refer_channels: int,
+    refer_frame_len: int,
     refer_frame_count_range: Dict,
+    shape_mode: str,
 ) -> Dict:
-    speaker_fbank_frame_count_range = _shape_range(1, int(speaker_fbank_shape[1]))
+    speaker_fbank_frame_count_range = (
+        _shape_range(1, int(speaker_fbank_shape[1])) if shape_mode == "dynamic" else None
+    )
     return {
         "shared_waveform_contract": {
             "channel_policy": "average_stereo_to_mono",
@@ -288,9 +338,13 @@ def _build_reference_audio_contract(
             "source": "refer_spectrogram",
             "channel_slice_start": 0,
             "channel_slice_end": int(refer_channels),
-            "target_frame_length": int(refer_frame_count_range["upper_bound"]),
-            "frame_count_range": dict(refer_frame_count_range),
-            "frame_padding": "dynamic_no_padding_or_right_truncate",
+            "target_frame_length": int(refer_frame_len),
+            "frame_count_range": dict(refer_frame_count_range) if shape_mode == "dynamic" else None,
+            "frame_padding": (
+                "dynamic_no_padding_or_right_truncate"
+                if shape_mode == "dynamic"
+                else "fixed_right_pad_or_right_truncate"
+            ),
         },
         "speaker_fbank_80_contract": {
             "source": "normalized_reference_waveform_resampled_from_32k_to_16k",
@@ -322,6 +376,12 @@ def parse_args():
     parser.add_argument("--vits-text-len", type=int, default=80)
     parser.add_argument("--vits-latent-len", type=int, default=80)
     parser.add_argument("--speaker-audio-sec", type=float, default=10.0)
+    parser.add_argument(
+        "--shape-mode",
+        choices=["dynamic", "fixed"],
+        default="dynamic",
+        help="Export bounded dynamic RangeDim inputs or fixed-capacity inputs.",
+    )
     parser.add_argument("--exclude-speaker-encoder", action="store_true")
     parser.add_argument("--noise-scale", type=float, default=0.5)
     parser.add_argument(
@@ -396,9 +456,48 @@ def export_vits_bundle(args):
         artifact_precision = precision_overrides.get(artifact_name, args.coreml_compute_precision)
         input_types_override = None
         if artifact_name == "decode_condition":
-            input_types_override = _build_decode_condition_input_types(model, args)
+            input_types_override = _resolve_input_types_override(
+                args.shape_mode,
+                _build_decode_condition_input_types,
+                model,
+                args,
+            )
+        elif artifact_name == "prior":
+            input_types_override = _resolve_input_types_override(
+                args.shape_mode,
+                _build_prior_input_types,
+                model,
+                args,
+            )
+        elif artifact_name == "latent_sampler":
+            input_types_override = _resolve_input_types_override(
+                args.shape_mode,
+                _build_latent_sampler_input_types,
+                model,
+                args,
+            )
+        elif artifact_name == "flow":
+            input_types_override = _resolve_input_types_override(
+                args.shape_mode,
+                _build_latent_like_input_types,
+                model,
+                args,
+                "z_p",
+            )
+        elif artifact_name == "wave_generator":
+            input_types_override = _resolve_input_types_override(
+                args.shape_mode,
+                _build_latent_like_input_types,
+                model,
+                args,
+                "z",
+            )
         elif artifact_name == "speaker_encoder":
-            input_types_override = _build_speaker_encoder_input_types(example_inputs)
+            input_types_override = _resolve_input_types_override(
+                args.shape_mode,
+                _build_speaker_encoder_input_types,
+                example_inputs,
+            )
         _export_coreml(
             output_path,
             spec,
@@ -425,15 +524,62 @@ def export_vits_bundle(args):
         "runtime": {
             "shapes": {
                 "refer_frame_len": int(args.vits_refer_frame_len),
-                "refer_frame_count_range": _shape_range(1, int(args.vits_refer_frame_len)),
+                "refer_frame_count_range": _shape_range(1, int(args.vits_refer_frame_len))
+                if args.shape_mode == "dynamic"
+                else None,
                 "semantic_code_len": int(args.vits_code_len),
+                "semantic_code_len_range": _shape_range(1, int(args.vits_code_len))
+                if args.shape_mode == "dynamic"
+                else None,
                 "text_phone_len": int(args.vits_text_len),
+                "text_phone_len_range": _shape_range(1, int(args.vits_text_len))
+                if args.shape_mode == "dynamic"
+                else None,
                 "latent_len": int(args.vits_latent_len),
+                "latent_len_range": _shape_range(1, int(args.vits_latent_len))
+                if args.shape_mode == "dynamic"
+                else None,
+            },
+            "capacity_contract": {
+                "python_behavior": {
+                    "refer": "dynamic_reference_spectrogram_frames",
+                    "codes": "dynamic_code_lengths",
+                    "text": "dynamic_text_lengths",
+                },
+                "current_export": {
+                    "refer": {
+                        "shape_mode": args.shape_mode,
+                        "frame_count_range": _shape_range(1, int(args.vits_refer_frame_len))
+                        if args.shape_mode == "dynamic"
+                        else None,
+                        "fixed_capacity": int(args.vits_refer_frame_len) if args.shape_mode == "fixed" else None,
+                    },
+                    "codes": {
+                        "shape_mode": args.shape_mode,
+                        "dynamic_range": _shape_range(1, int(args.vits_code_len)) if args.shape_mode == "dynamic" else None,
+                        "fixed_capacity": int(args.vits_code_len) if args.shape_mode == "fixed" else None,
+                        "caller_must_supply_code_lengths": True,
+                    },
+                    "text": {
+                        "shape_mode": args.shape_mode,
+                        "dynamic_range": _shape_range(1, int(args.vits_text_len)) if args.shape_mode == "dynamic" else None,
+                        "fixed_capacity": int(args.vits_text_len) if args.shape_mode == "fixed" else None,
+                        "caller_must_supply_text_lengths": True,
+                    },
+                    "latent": {
+                        "shape_mode": args.shape_mode,
+                        "dynamic_range": _shape_range(1, int(args.vits_latent_len))
+                        if args.shape_mode == "dynamic"
+                        else None,
+                        "fixed_capacity": int(args.vits_latent_len) if args.shape_mode == "fixed" else None,
+                    },
+                },
             },
             "coreml": {
                 "compute_units": args.coreml_compute_units,
                 "minimum_deployment_target": args.coreml_minimum_deployment_target,
                 "compute_precision": args.coreml_compute_precision,
+                "shape_mode": args.shape_mode,
                 "artifact_compute_precision": {
                     artifact_name: artifacts[artifact_name]["compute_precision"] for artifact_name in artifacts
                 },
@@ -447,7 +593,9 @@ def export_vits_bundle(args):
             vits_data_config,
             speaker_fbank_shape=speaker_fbank_shape,
             refer_channels=int(model.ref_enc.in_dim),
+            refer_frame_len=int(args.vits_refer_frame_len),
             refer_frame_count_range=refer_frame_count_range,
+            shape_mode=args.shape_mode,
         )
     manifest_path = os.path.join(args.bundle_dir, "manifest.json")
     _write_json(manifest_path, manifest)

@@ -4,6 +4,7 @@ import os
 import sys
 from typing import Dict, List
 
+import numpy as np
 import torch
 
 NOW_DIR = os.getcwd()
@@ -41,6 +42,89 @@ def _spec_to_schema(spec) -> Dict:
         "outputs": [_tensor_spec_to_dict(item) for item in spec.outputs],
         "notes": list(spec.notes),
     }
+
+
+def _shape_range(lower_bound: int, upper_bound: int) -> Dict:
+    return {
+        "lower_bound": int(lower_bound),
+        "upper_bound": int(upper_bound),
+    }
+
+
+def _build_prefill_input_types(args):
+    import coremltools as ct
+
+    prompt_len = ct.RangeDim(lower_bound=1, upper_bound=int(args.prompt_len), symbol="prompt_frames")
+    ref_phone_len = ct.RangeDim(lower_bound=1, upper_bound=int(args.ref_phone_len), symbol="ref_phone_count")
+    text_phone_len = ct.RangeDim(lower_bound=1, upper_bound=int(args.text_phone_len), symbol="text_phone_count")
+    return [
+        ct.TensorType(name="prompts", shape=(1, prompt_len), dtype=np.int32),
+        ct.TensorType(name="prompt_length", shape=(1,), dtype=np.int32),
+        ct.TensorType(name="ref_seq", shape=(1, ref_phone_len), dtype=np.int32),
+        ct.TensorType(name="ref_seq_length", shape=(1,), dtype=np.int32),
+        ct.TensorType(name="text_seq", shape=(1, text_phone_len), dtype=np.int32),
+        ct.TensorType(name="text_seq_length", shape=(1,), dtype=np.int32),
+        ct.TensorType(name="ref_bert", shape=(1024, ref_phone_len), dtype=np.float32),
+        ct.TensorType(name="text_bert", shape=(1024, text_phone_len), dtype=np.float32),
+    ]
+
+
+def _resolve_input_types_override(shape_mode: str, builder, *builder_args):
+    if shape_mode == "fixed":
+        return None
+    return builder(*builder_args)
+
+
+def _build_prefill_core_input_types(prepare_outputs):
+    import coremltools as ct
+
+    xy_pos, prompt_attn_mask, _, _ = prepare_outputs
+    hidden_dim = int(xy_pos.shape[2])
+    heads = int(prompt_attn_mask.shape[1])
+    src_tokens = ct.RangeDim(lower_bound=1, upper_bound=int(xy_pos.shape[1]), symbol="src_tokens")
+    return [
+        ct.TensorType(name="xy_pos", shape=(1, src_tokens, hidden_dim), dtype=np.float32),
+        ct.TensorType(name="prompt_attn_mask", shape=(1, heads, src_tokens, src_tokens), dtype=np.int32),
+        ct.TensorType(name="active_src_len", shape=(1,), dtype=np.int32),
+        ct.TensorType(name="position_seed", shape=(1,), dtype=np.int32),
+    ]
+
+
+def _build_decode_step_input_types(decode_inputs):
+    import coremltools as ct
+
+    k_cache = decode_inputs[3]
+    cache_layers = int(k_cache.shape[0])
+    hidden_dim = int(k_cache.shape[3])
+    cache_capacity = ct.RangeDim(lower_bound=1, upper_bound=int(k_cache.shape[2]), symbol="cache_capacity")
+    return [
+        ct.TensorType(name="last_token", shape=(1, 1), dtype=np.int32),
+        ct.TensorType(name="position_index", shape=(1,), dtype=np.int32),
+        ct.TensorType(name="cache_len", shape=(1,), dtype=np.int32),
+        ct.TensorType(name="k_cache", shape=(cache_layers, 1, cache_capacity, hidden_dim), dtype=np.float32),
+        ct.TensorType(name="v_cache", shape=(cache_layers, 1, cache_capacity, hidden_dim), dtype=np.float32),
+    ]
+
+
+def _build_decode_core_input_types(decode_inputs, decode_xy_pos):
+    import coremltools as ct
+
+    k_cache = decode_inputs[3]
+    cache_layers = int(k_cache.shape[0])
+    hidden_dim = int(k_cache.shape[3])
+    xy_hidden_dim = int(decode_xy_pos.shape[2])
+    if hidden_dim != xy_hidden_dim:
+        raise ValueError(
+            f"T2S decode hidden dim mismatch: xy_pos={xy_hidden_dim}, k_cache hidden_dim={hidden_dim}"
+        )
+    cache_capacity = ct.RangeDim(lower_bound=1, upper_bound=int(k_cache.shape[2]), symbol="cache_capacity")
+    return [
+        ct.TensorType(name="xy_pos", shape=(1, 1, hidden_dim), dtype=np.float32),
+        ct.TensorType(name="position_index", shape=(1,), dtype=np.int32),
+        ct.TensorType(name="cache_len", shape=(1,), dtype=np.int32),
+        ct.TensorType(name="k_cache", shape=(cache_layers, 1, cache_capacity, hidden_dim), dtype=np.float32),
+        ct.TensorType(name="v_cache", shape=(cache_layers, 1, cache_capacity, hidden_dim), dtype=np.float32),
+    ]
 
 
 def _build_prefill_inputs(args):
@@ -222,6 +306,12 @@ def parse_args():
     parser.add_argument("--text-phone-len", type=int, default=120)
     parser.add_argument("--max-decode-steps", type=int, default=1500)
     parser.add_argument(
+        "--shape-mode",
+        choices=["dynamic", "fixed"],
+        default="dynamic",
+        help="Export bounded dynamic RangeDim inputs or fixed-capacity inputs.",
+    )
+    parser.add_argument(
         "--prefill-variant",
         choices=["default", "residual_layernorm_fp32"],
         default="default",
@@ -293,6 +383,7 @@ def main():
             prefill_spec,
             prefill_wrapper,
             prefill_inputs,
+            input_types_override=_resolve_input_types_override(args.shape_mode, _build_prefill_input_types, args),
             compute_units=args.coreml_compute_units,
             minimum_deployment_target=args.coreml_minimum_deployment_target,
             compute_precision=prefill_precision,
@@ -334,6 +425,7 @@ def main():
             prepare_spec,
             prepare_wrapper,
             prefill_inputs,
+            input_types_override=_resolve_input_types_override(args.shape_mode, _build_prefill_input_types, args),
             compute_units=args.coreml_compute_units,
             minimum_deployment_target=args.coreml_minimum_deployment_target,
             compute_precision=prepare_precision,
@@ -344,6 +436,11 @@ def main():
             core_spec,
             core_wrapper,
             tuple(t.to(device=args.device) for t in prepare_outputs),
+            input_types_override=_resolve_input_types_override(
+                args.shape_mode,
+                _build_prefill_core_input_types,
+                prepare_outputs,
+            ),
             compute_units=args.coreml_compute_units,
             minimum_deployment_target=args.coreml_minimum_deployment_target,
             compute_precision=core_precision,
@@ -382,6 +479,11 @@ def main():
             decode_spec,
             decode_wrapper,
             decode_inputs,
+            input_types_override=_resolve_input_types_override(
+                args.shape_mode,
+                _build_decode_step_input_types,
+                decode_inputs,
+            ),
             compute_units=args.coreml_compute_units,
             minimum_deployment_target=args.coreml_minimum_deployment_target,
             compute_precision=decode_precision,
@@ -434,6 +536,12 @@ def main():
                 decode_inputs[3],
                 decode_inputs[4],
             ),
+            input_types_override=_resolve_input_types_override(
+                args.shape_mode,
+                _build_decode_core_input_types,
+                decode_inputs,
+                decode_xy_pos,
+            ),
             compute_units=args.coreml_compute_units,
             minimum_deployment_target=args.coreml_minimum_deployment_target,
             compute_precision=decode_core_precision,
@@ -477,8 +585,48 @@ def main():
             },
             "shapes": {
                 "prompt_len": int(args.prompt_len),
+                "prompt_len_range": _shape_range(1, int(args.prompt_len)) if args.shape_mode == "dynamic" else None,
                 "ref_phone_len": int(args.ref_phone_len),
+                "ref_phone_len_range": _shape_range(1, int(args.ref_phone_len))
+                if args.shape_mode == "dynamic"
+                else None,
                 "text_phone_len": int(args.text_phone_len),
+                "text_phone_len_range": _shape_range(1, int(args.text_phone_len))
+                if args.shape_mode == "dynamic"
+                else None,
+            },
+            "capacity_contract": {
+                "python_behavior": {
+                    "prompt_semantic": "runtime_length_before_right_padding",
+                    "ref_seq": "runtime_length_before_right_padding",
+                    "text_seq": "runtime_length_before_right_padding",
+                    "batch_padding": "python_left_pad_to_runtime_batch_max_len",
+                    "max_decode_steps": int(args.max_decode_steps),
+                },
+                "current_export": {
+                    "prompts": {
+                        "shape_mode": args.shape_mode,
+                        "dynamic_range": _shape_range(1, int(args.prompt_len)) if args.shape_mode == "dynamic" else None,
+                        "fixed_capacity": int(args.prompt_len) if args.shape_mode == "fixed" else None,
+                        "caller_must_supply_prompt_length": True,
+                    },
+                    "ref_seq": {
+                        "shape_mode": args.shape_mode,
+                        "dynamic_range": _shape_range(1, int(args.ref_phone_len))
+                        if args.shape_mode == "dynamic"
+                        else None,
+                        "fixed_capacity": int(args.ref_phone_len) if args.shape_mode == "fixed" else None,
+                        "caller_must_supply_ref_seq_length": True,
+                    },
+                    "text_seq": {
+                        "shape_mode": args.shape_mode,
+                        "dynamic_range": _shape_range(1, int(args.text_phone_len))
+                        if args.shape_mode == "dynamic"
+                        else None,
+                        "fixed_capacity": int(args.text_phone_len) if args.shape_mode == "fixed" else None,
+                        "caller_must_supply_text_seq_length": True,
+                    },
+                },
             },
             "prefill_export_mode": args.prefill_export_mode,
             "decode_export_mode": args.decode_export_mode,
@@ -486,6 +634,7 @@ def main():
                 "compute_units": args.coreml_compute_units,
                 "minimum_deployment_target": args.coreml_minimum_deployment_target,
                 "compute_precision": args.coreml_compute_precision,
+                "shape_mode": args.shape_mode,
                 "artifact_compute_precision": artifact_compute_precision,
                 "artifact_fp16_skip_op_types": artifact_fp16_skip_op_types,
             },

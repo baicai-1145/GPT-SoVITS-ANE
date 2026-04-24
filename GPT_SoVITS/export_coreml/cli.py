@@ -172,6 +172,17 @@ def _build_speaker_encoder_input_types(example_inputs):
     ]
 
 
+def _build_zh_bert_char_input_types(upper_bound: int):
+    import coremltools as ct
+
+    text_tokens = ct.RangeDim(lower_bound=1, upper_bound=int(upper_bound), symbol="text_tokens")
+    return [
+        ct.TensorType(name="input_ids", shape=(1, text_tokens), dtype=np.int32),
+        ct.TensorType(name="attention_mask", shape=(1, text_tokens), dtype=np.int32),
+        ct.TensorType(name="token_type_ids", shape=(1, text_tokens), dtype=np.int32),
+    ]
+
+
 def _build_ssl_latent_target(args) -> Tuple[torch.nn.Module, Tuple[torch.Tensor, ...]]:
     model = load_vits_model(args.sovits_weights, device=args.device, is_half=False, version_override=args.sovits_version)
     wrapper = PromptSemanticExtractorWrapper(model).eval().to(args.device)
@@ -439,6 +450,7 @@ def _export_coreml(
     example_inputs,
     input_types_override=None,
     output_types_override=None,
+    user_defined_metadata: Dict[str, str] | None = None,
     compute_units: str = "all",
     minimum_deployment_target: str = "macos15",
     compute_precision: str = "float32",
@@ -480,6 +492,9 @@ def _export_coreml(
     model.user_defined_metadata["compute_precision"] = compute_precision
     if fp16_skip_op_types:
         model.user_defined_metadata["fp16_skip_op_types"] = ",".join(fp16_skip_op_types)
+    if user_defined_metadata:
+        for key, value in user_defined_metadata.items():
+            model.user_defined_metadata[key] = value
     model.save(output_path)
 
 
@@ -521,7 +536,7 @@ def parse_args():
     parser.add_argument("--g2pw-model-source", default="GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large")
     parser.add_argument("--g2pw-example-text", default="重庆火锅很好吃")
     parser.add_argument("--g2pw-batch-size", type=int, default=8)
-    parser.add_argument("--g2pw-token-len", type=int, default=64)
+    parser.add_argument("--g2pw-token-len", type=int, default=512)
     parser.add_argument("--cnhubert-base-path", default="GPT_SoVITS/pretrained_models/chinese-hubert-base")
     parser.add_argument("--t2s-weights", default="GPT_SoVITS/pretrained_models/s1v3.ckpt")
     parser.add_argument("--sovits-weights", default="GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth")
@@ -570,14 +585,22 @@ def main():
         _export_torchscript(args.target, args.output, module, example_inputs)
     else:
         input_types_override = None
+        user_defined_metadata = None
         if args.target == "speaker_encoder":
             input_types_override = _build_speaker_encoder_input_types(example_inputs)
+        elif args.target == "zh_bert_char":
+            input_types_override = _build_zh_bert_char_input_types(upper_bound=512)
+            user_defined_metadata = {
+                "gpt_sovits_dynamic_token_dim": "true",
+                "gpt_sovits_output_mode": "char_feature",
+            }
         _export_coreml(
             args.output,
             spec,
             module,
             example_inputs,
             input_types_override=input_types_override,
+            user_defined_metadata=user_defined_metadata,
             compute_units=args.coreml_compute_units,
             minimum_deployment_target=args.coreml_minimum_deployment_target,
             compute_precision=args.coreml_compute_precision,

@@ -40,11 +40,18 @@ def _build_runtime_contract() -> Dict:
     }
 
 
-def _build_audio_input_contract(input_sample_count: int, trailing_silence_sample_count: int) -> Dict:
+def _build_audio_input_contract(
+    raw_reference_sample_count_range: Dict,
+    active_input_sample_count: int,
+    active_input_sample_count_range: Dict,
+    trailing_silence_sample_count: int,
+) -> Dict:
     return {
         "channel_policy": "average_to_mono",
         "target_sample_rate": 16000,
         "trailing_silence_sample_count": int(trailing_silence_sample_count),
+        "raw_reference_sample_count_range": dict(raw_reference_sample_count_range),
+        "active_input_sample_count_range": dict(active_input_sample_count_range),
         "normalization": {
             "source": "python_prompt_semantic_raw_waveform_path",
             "do_normalize": False,
@@ -52,7 +59,7 @@ def _build_audio_input_contract(input_sample_count: int, trailing_silence_sample
         },
         "padding": {
             "mode": "dynamic_no_padding",
-            "target_sample_count": int(input_sample_count),
+            "target_sample_count": int(active_input_sample_count),
         },
     }
 
@@ -71,27 +78,37 @@ def _resolve_trailing_silence_sample_count(args) -> int:
     return int(round(source_sample_rate * args.trailing_silence_sec))
 
 
-def _resolve_input_sample_count_range(input_sample_count: int, trailing_silence_sample_count: int) -> Dict:
+def _resolve_raw_reference_sample_count_range(raw_reference_sample_count: int) -> Dict:
     min_reference_seconds = 3.0
     min_reference_sample_count = int(round(16000 * min_reference_seconds))
-    min_total_sample_count = min(
-        max(min_reference_sample_count + int(trailing_silence_sample_count), 1),
-        int(input_sample_count),
+    min_raw_reference_sample_count = min(
+        max(min_reference_sample_count, 1),
+        int(raw_reference_sample_count),
     )
-    return _shape_range(min_total_sample_count, int(input_sample_count))
+    return _shape_range(min_raw_reference_sample_count, int(raw_reference_sample_count))
+
+
+def _resolve_active_input_sample_count_range(
+    raw_reference_sample_count_range: Dict,
+    trailing_silence_sample_count: int,
+) -> Dict:
+    return _shape_range(
+        int(raw_reference_sample_count_range["lower_bound"]) + int(trailing_silence_sample_count),
+        int(raw_reference_sample_count_range["upper_bound"]) + int(trailing_silence_sample_count),
+    )
 
 
 def _resolve_dynamic_shape_ranges(
     cnhubert_wrapper,
     ssl_latent_wrapper,
     args,
-    input_sample_count_range: Dict,
+    active_input_sample_count_range: Dict,
     ssl_content_shape: list[int],
     prompt_shape: list[int],
 ) -> Dict:
     import torch
 
-    min_input_sample_count = int(input_sample_count_range["lower_bound"])
+    min_input_sample_count = int(active_input_sample_count_range["lower_bound"])
     max_ssl_frames = int(ssl_content_shape[-1])
     max_prompt_len = int(prompt_shape[-1])
     with torch.no_grad():
@@ -104,7 +121,7 @@ def _resolve_dynamic_shape_ranges(
         )
         min_prompt_len = int(min_prompt.shape[-1])
     return {
-        "input_sample_count_range": input_sample_count_range,
+        "input_sample_count_range": active_input_sample_count_range,
         "ssl_frame_range": _shape_range(min_ssl_frames, max_ssl_frames),
         "prompt_len_range": _shape_range(min_prompt_len, max_prompt_len),
     }
@@ -131,7 +148,7 @@ def parse_args():
     parser.add_argument("--sovits-weights", default="GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth")
     parser.add_argument("--sovits-version", default="v2ProPlus")
     parser.add_argument("--example-audio")
-    parser.add_argument("--example-audio-sec", type=float, default=3.21)
+    parser.add_argument("--example-audio-sec", type=float, default=10.0)
     parser.add_argument("--ssl-channels", type=int, default=768)
     parser.add_argument("--ssl-frames", type=int, default=160)
     parser.add_argument("--trailing-silence-sec", type=float, default=0.3)
@@ -166,21 +183,43 @@ def main():
     ssl_latent_output_path = os.path.join(args.bundle_dir, ssl_latent_filename)
 
     trailing_silence_sample_count = _resolve_trailing_silence_sample_count(args)
-    input_sample_count = int(cnhubert_inputs[0].shape[-1])
+    raw_reference_sample_count = int(cnhubert_inputs[0].shape[-1])
+    raw_reference_sample_count_range = _resolve_raw_reference_sample_count_range(
+        raw_reference_sample_count
+    )
+    active_input_sample_count = raw_reference_sample_count + int(trailing_silence_sample_count)
+    active_input_sample_count_range = _resolve_active_input_sample_count_range(
+        raw_reference_sample_count_range,
+        trailing_silence_sample_count,
+    )
     import torch
 
     with torch.no_grad():
-        cnhubert_output_shape = [int(dim) for dim in cnhubert_wrapper(*cnhubert_inputs).shape]
-        prompt_shape = [1, int(ssl_latent_wrapper(*ssl_latent_inputs).shape[-1])]
-    input_sample_count_range = _resolve_input_sample_count_range(
-        input_sample_count,
-        trailing_silence_sample_count,
-    )
+        max_ssl_content = cnhubert_wrapper(
+            torch.zeros(
+                (1, int(active_input_sample_count_range["upper_bound"])),
+                dtype=torch.float32,
+                device=args.device,
+            )
+        )
+        cnhubert_output_shape = [int(dim) for dim in max_ssl_content.shape]
+        prompt_shape = [
+            1,
+            int(
+                ssl_latent_wrapper(
+                    torch.zeros(
+                        (1, int(args.ssl_channels), int(cnhubert_output_shape[-1])),
+                        dtype=torch.float32,
+                        device=args.device,
+                    )
+                ).shape[-1]
+            ),
+        ]
     dynamic_shape_ranges = _resolve_dynamic_shape_ranges(
         cnhubert_wrapper,
         ssl_latent_wrapper,
         args,
-        input_sample_count_range,
+        active_input_sample_count_range,
         cnhubert_output_shape,
         prompt_shape,
     )
@@ -254,7 +293,7 @@ def main():
         },
         "runtime": {
             "shapes": {
-                "input_sample_count": input_sample_count,
+                "input_sample_count": active_input_sample_count,
                 "ssl_content_shape": cnhubert_output_shape,
                 "prompt_shape": prompt_shape,
                 "prompt_len": prompt_shape[-1],
@@ -262,9 +301,22 @@ def main():
                 **dynamic_shape_ranges,
             },
             "audio_input_contract": _build_audio_input_contract(
-                input_sample_count,
+                raw_reference_sample_count_range,
+                active_input_sample_count,
+                active_input_sample_count_range,
                 trailing_silence_sample_count,
             ),
+            "capacity_contract": {
+                "python_behavior": {
+                    "raw_reference_audio_sample_count_range": dict(raw_reference_sample_count_range),
+                    "trailing_silence_sample_count": int(trailing_silence_sample_count),
+                },
+                "current_export": {
+                    "active_input_sample_count": int(active_input_sample_count),
+                    "active_input_sample_count_range": dict(active_input_sample_count_range),
+                    "prompt_len": int(prompt_shape[-1]),
+                },
+            },
             "coreml": {
                 "compute_units": args.coreml_compute_units,
                 "minimum_deployment_target": args.coreml_minimum_deployment_target,

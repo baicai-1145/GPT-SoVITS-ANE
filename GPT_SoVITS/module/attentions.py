@@ -277,19 +277,18 @@ class MultiHeadAttention(nn.Module):
 
     def _get_relative_embeddings(self, relative_embeddings, length):
         max_relative_position = 2 * self.window_size + 1
-        # Pad first before slice to avoid using cond ops.
-        pad_length = max(length - (self.window_size + 1), 0)
-        slice_start_position = max((self.window_size + 1) - length, 0)
-        slice_end_position = slice_start_position + 2 * length - 1
-        if pad_length > 0:
-            padded_relative_embeddings = F.pad(
-                relative_embeddings,
-                commons.convert_pad_shape([[0, 0], [pad_length, pad_length], [0, 0]]),
-            )
-        else:
-            padded_relative_embeddings = relative_embeddings
-        used_relative_embeddings = padded_relative_embeddings[:, slice_start_position:slice_end_position]
-        return used_relative_embeddings
+        relative_positions = (
+            torch.arange(2 * length - 1, device=relative_embeddings.device, dtype=torch.long) - (length - 1)
+        )
+        relative_indices = relative_positions + self.window_size
+        valid = (relative_indices >= 0) & (relative_indices < max_relative_position)
+        clamped_indices = relative_indices.clamp(0, max_relative_position - 1)
+        used_relative_embeddings = torch.index_select(relative_embeddings, dim=1, index=clamped_indices)
+        return torch.where(
+            valid.view(1, -1, 1),
+            used_relative_embeddings,
+            torch.zeros_like(used_relative_embeddings),
+        )
 
     def _relative_position_to_absolute_position(self, x):
         """
@@ -297,12 +296,13 @@ class MultiHeadAttention(nn.Module):
         ret: [b, h, l, l]
         """
         batch, heads, length, _ = x.size()
-        # Concat columns of pad to shift from relative to absolute indexing.
-        x = F.pad(x, commons.convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, 1]]))
+        zero_col = torch.zeros((batch, heads, length, 1), dtype=x.dtype, device=x.device)
+        x = torch.cat([x, zero_col], dim=-1)
 
         # Concat extra elements so to add up to shape (len+1, 2*len-1).
         x_flat = x.view([batch, heads, length * 2 * length])
-        x_flat = F.pad(x_flat, commons.convert_pad_shape([[0, 0], [0, 0], [0, length - 1]]))
+        zero_tail = torch.zeros((batch, heads, length - 1), dtype=x.dtype, device=x.device)
+        x_flat = torch.cat([x_flat, zero_tail], dim=-1)
 
         # Reshape and slice out the padded elements.
         x_final = x_flat.view([batch, heads, length + 1, 2 * length - 1])[:, :, :length, length - 1 :]
@@ -314,11 +314,11 @@ class MultiHeadAttention(nn.Module):
         ret: [b, h, l, 2*l-1]
         """
         batch, heads, length, _ = x.size()
-        # padd along column
-        x = F.pad(x, commons.convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, length - 1]]))
+        zero_tail = torch.zeros((batch, heads, length, length - 1), dtype=x.dtype, device=x.device)
+        x = torch.cat([x, zero_tail], dim=-1)
         x_flat = x.view([batch, heads, length**2 + length * (length - 1)])
-        # add 0's in the beginning that will skew the elements after reshape
-        x_flat = F.pad(x_flat, commons.convert_pad_shape([[0, 0], [0, 0], [length, 0]]))
+        zero_head = torch.zeros((batch, heads, length), dtype=x.dtype, device=x.device)
+        x_flat = torch.cat([zero_head, x_flat], dim=-1)
         x_final = x_flat.view([batch, heads, length, 2 * length])[:, :, :, 1:]
         return x_final
 

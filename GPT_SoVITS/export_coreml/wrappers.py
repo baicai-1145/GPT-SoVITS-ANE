@@ -48,10 +48,15 @@ def _zero_invalid_cache_tail(cache: Tensor, next_cache_len: Tensor) -> Tensor:
 
 def _update_cache_slot(cache: Tensor, value: Tensor, cache_len: Tensor) -> Tensor:
     cache_index = cache_len.reshape(-1).to(dtype=torch.long, device=cache.device)
-    write_mask = F.one_hot(cache_index, num_classes=cache.shape[1]).to(device=cache.device, dtype=torch.bool)
-    write_mask = write_mask.view(cache.shape[0], cache.shape[1], 1)
+    positions = torch.arange(cache.shape[1], device=cache.device, dtype=torch.long).view(1, cache.shape[1], 1)
+    write_mask = positions == cache_index.view(-1, 1, 1)
     expanded_value = value.expand(-1, cache.shape[1], -1)
     return torch.where(write_mask, expanded_value, cache)
+
+
+def _nearest_upsample_1d_x2(x: Tensor) -> Tensor:
+    x = x.unsqueeze(-1).expand(-1, -1, -1, 2)
+    return x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3])
 
 
 def _run_t2s_mlp(mlp, x: Tensor) -> Tensor:
@@ -303,7 +308,7 @@ class VITSPriorWrapper(nn.Module):
 
         quantized = self.quantizer.decode(codes)
         if self.semantic_frame_rate == "25hz":
-            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+            quantized = _nearest_upsample_1d_x2(quantized)
 
         _, prior_mean, prior_log_scale, y_mask, _, _ = self.enc_p(
             quantized,

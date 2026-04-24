@@ -7,6 +7,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import jieba_fast as jieba
+import numpy as np
 from pypinyin import Style, lazy_pinyin
 
 NOW_DIR = os.getcwd()
@@ -65,6 +66,13 @@ _MARKED_VOWEL_TO_ASCII = {
 }
 
 _AUTHORITATIVE_PROGRESS_VERSION = 2
+
+
+def _shape_range(lower_bound: int, upper_bound: int) -> Dict[str, int]:
+    return {
+        "lower_bound": int(lower_bound),
+        "upper_bound": int(upper_bound),
+    }
 
 
 def _load_pinyin_to_phone_map() -> Dict[str, List[str]]:
@@ -153,27 +161,74 @@ def _resolve_label_phone_template(label: str, converter, pinyin_to_phone_map: Di
         return _make_phone_template(label, initial_phone, final_phone_base, tone)
 
     return None
-
-
-def _build_runtime_contract(polyphonic_context_chars: int) -> Dict:
+def _build_runtime_contract(
+    polyphonic_context_chars: int,
+    batch_size: int,
+    token_len: int,
+    shape_mode: str,
+) -> Dict:
     return {
         "driver": "g2pw_polyphonic_disambiguation",
         "query_alignment": "char_aligned",
         "padding_contract": {
-            "batch_padding_mode": "duplicate_last_valid_query",
-            "caller_must_ignore_rows_beyond_real_query_count": True,
+            "batch_padding_mode": (
+                "per_batch_right_pad_tokens_only_for_dynamic_bundle"
+                if shape_mode == "dynamic"
+                else "right_pad_rows_and_tokens_to_fixed_capacity"
+            ),
+            "caller_must_ignore_rows_beyond_real_query_count": False,
         },
         "tokenization_contract": {
             "tokenizer": "bert_wordpiece",
             "special_tokens": ["[CLS]", "[SEP]", "[PAD]", "[UNK]"],
             "position_id_offset": 1,
+            "python_reference_max_token_len": 512,
         },
         "polyphonic_context_contract": {
             "mode": "crop_to_polyphonic_span_with_context",
             "context_chars_per_side": int(polyphonic_context_chars),
             "fallback_when_exceeds_token_len": "truncate_around_query_token",
         },
+        "capacity_contract": {
+            "python_behavior": {
+                "query_count": "host_side_dynamic_batching",
+                "token_len": 512,
+            },
+            "current_export": {
+                "query_count": {
+                    "shape_mode": shape_mode,
+                    "dynamic_range": _shape_range(1, int(batch_size)) if shape_mode == "dynamic" else None,
+                    "fixed_capacity": int(batch_size) if shape_mode == "fixed" else None,
+                },
+                "token_len": {
+                    "shape_mode": shape_mode,
+                    "dynamic_range": _shape_range(1, int(token_len)) if shape_mode == "dynamic" else None,
+                    "fixed_capacity": int(token_len) if shape_mode == "fixed" else None,
+                },
+            },
+        },
     }
+
+
+def _build_g2pw_input_types(batch_size: int, token_len: int, label_count: int):
+    import coremltools as ct
+
+    batch = ct.RangeDim(lower_bound=1, upper_bound=int(batch_size), symbol="batch")
+    tokens = ct.RangeDim(lower_bound=1, upper_bound=int(token_len), symbol="token_len")
+    return [
+        ct.TensorType(name="input_ids", shape=(batch, tokens), dtype=np.int32),
+        ct.TensorType(name="token_type_ids", shape=(batch, tokens), dtype=np.int32),
+        ct.TensorType(name="attention_mask", shape=(batch, tokens), dtype=np.int32),
+        ct.TensorType(name="phoneme_mask", shape=(batch, int(label_count)), dtype=np.float32),
+        ct.TensorType(name="char_ids", shape=(batch,), dtype=np.int32),
+        ct.TensorType(name="position_ids", shape=(batch,), dtype=np.int32),
+    ]
+
+
+def _resolve_input_types_override(shape_mode: str, builder, *builder_args):
+    if shape_mode == "fixed":
+        return None
+    return builder(*builder_args)
 
 
 def _contains_cjk(value: str) -> bool:
@@ -340,6 +395,41 @@ def _write_progress_manifest(
             "total_word_count": int(total_word_count),
         },
     )
+
+
+def _default_authoritative_progress_dir(bundle_dir: str) -> str:
+    return os.path.join(f"{os.path.abspath(bundle_dir)}.build", "phrase_template_progress")
+
+
+def _resolve_authoritative_progress_dir(
+    *,
+    bundle_dir: str,
+    assets_dir: str,
+    explicit_progress_dir: Optional[str],
+) -> str:
+    if explicit_progress_dir:
+        return os.path.abspath(explicit_progress_dir)
+
+    legacy_progress_dir = os.path.join(assets_dir, "phrase_template_progress")
+    default_progress_dir = _default_authoritative_progress_dir(bundle_dir)
+    if os.path.isdir(legacy_progress_dir) and not os.path.exists(default_progress_dir):
+        os.makedirs(os.path.dirname(default_progress_dir), exist_ok=True)
+        shutil.move(legacy_progress_dir, default_progress_dir)
+        print(
+            "[g2pw_bundle] moved legacy authoritative progress cache out of bundle: "
+            f"{legacy_progress_dir} -> {default_progress_dir}"
+        )
+    return default_progress_dir
+
+
+def _cleanup_bundle_local_progress_dir(*, assets_dir: str, active_progress_dir: Optional[str]) -> None:
+    legacy_progress_dir = os.path.abspath(os.path.join(assets_dir, "phrase_template_progress"))
+    if not os.path.isdir(legacy_progress_dir):
+        return
+    if active_progress_dir and os.path.abspath(active_progress_dir) == legacy_progress_dir:
+        return
+    shutil.rmtree(legacy_progress_dir)
+    print(f"[g2pw_bundle] removed export-only bundle cache at {legacy_progress_dir}")
 
 
 def _build_phrase_phone_templates(
@@ -621,7 +711,13 @@ def parse_args():
     )
     parser.add_argument("--g2pw-example-text", default="重庆火锅很好吃")
     parser.add_argument("--g2pw-batch-size", type=int, default=8)
-    parser.add_argument("--g2pw-token-len", type=int, default=64)
+    parser.add_argument("--g2pw-token-len", type=int, default=512)
+    parser.add_argument(
+        "--shape-mode",
+        choices=["dynamic", "fixed"],
+        default="dynamic",
+        help="Export bounded dynamic RangeDim inputs or fixed-capacity inputs.",
+    )
     parser.add_argument(
         "--runtime-assets-only",
         action="store_true",
@@ -635,7 +731,11 @@ def parse_args():
     )
     parser.add_argument(
         "--authoritative-progress-dir",
-        help="Optional directory for resumable authoritative phrase template chunks. Defaults to <bundle-dir>/assets/phrase_template_progress.",
+        help=(
+            "Optional directory for resumable authoritative phrase template chunks. "
+            "Defaults to sibling build cache <bundle-dir>.build/phrase_template_progress "
+            "so export-only cache files stay outside the runtime bundle."
+        ),
     )
     parser.add_argument(
         "--authoritative-word-limit",
@@ -658,6 +758,9 @@ def main():
     if os.path.exists(manifest_path):
         with open(manifest_path, "r", encoding="utf-8") as handle:
             existing_manifest = json.load(handle)
+    shape_mode = args.shape_mode
+    if args.runtime_assets_only and existing_manifest is not None:
+        shape_mode = existing_manifest.get("runtime", {}).get("coreml", {}).get("shape_mode", shape_mode)
 
     if args.runtime_assets_only:
         if not os.path.exists(model_output_path):
@@ -672,6 +775,13 @@ def main():
             spec,
             wrapper,
             example_inputs,
+            input_types_override=_resolve_input_types_override(
+                shape_mode,
+                _build_g2pw_input_types,
+                int(example_inputs[0].shape[0]),
+                int(example_inputs[0].shape[1]),
+                int(example_inputs[3].shape[1]),
+            ),
             compute_units=args.coreml_compute_units,
             minimum_deployment_target=args.coreml_minimum_deployment_target,
             compute_precision=args.coreml_compute_precision,
@@ -682,16 +792,20 @@ def main():
         model_source=args.g2pw_model_source,
         enable_non_traditional_chinese=True,
     )
-    authoritative_progress_dir = (
-        args.authoritative_progress_dir
-        if args.authoritative_progress_dir
-        else os.path.join(assets_dir, "phrase_template_progress")
+    authoritative_progress_dir = _resolve_authoritative_progress_dir(
+        bundle_dir=args.bundle_dir,
+        assets_dir=assets_dir,
+        explicit_progress_dir=args.authoritative_progress_dir,
     )
     runtime_assets = _build_runtime_assets(
         converter,
         authoritative_progress_dir=authoritative_progress_dir,
         authoritative_chunk_size=args.authoritative_chunk_size,
         authoritative_word_limit=args.authoritative_word_limit,
+    )
+    _cleanup_bundle_local_progress_dir(
+        assets_dir=assets_dir,
+        active_progress_dir=authoritative_progress_dir,
     )
 
     runtime_assets_filename = "g2pw_assets.json"
@@ -713,10 +827,25 @@ def main():
         batch_size = int(existing_manifest["runtime"]["shapes"]["batch_size"])
         token_len = int(existing_manifest["runtime"]["shapes"]["token_len"])
         label_count = int(existing_manifest["runtime"]["shapes"]["label_count"])
+        batch_size_range = existing_manifest["runtime"]["shapes"].get("batch_size_range")
+        token_len_range = existing_manifest["runtime"]["shapes"].get("token_len_range")
     else:
         batch_size = int(args.g2pw_batch_size)
         token_len = int(args.g2pw_token_len)
         label_count = int(len(converter.labels))
+        batch_size_range = None
+        token_len_range = None
+    if example_inputs is not None and shape_mode == "dynamic":
+        batch_size_range = _shape_range(1, batch_size)
+        token_len_range = _shape_range(1, token_len)
+    if shape_mode == "dynamic":
+        if batch_size_range is None:
+            batch_size_range = _shape_range(1, batch_size)
+        if token_len_range is None:
+            token_len_range = _shape_range(1, token_len)
+    else:
+        batch_size_range = None
+        token_len_range = None
     manifest = {
         "schema_version": 1,
         "bundle_type": "gpt_sovits_g2pw_coreml_bundle",
@@ -742,15 +871,23 @@ def main():
         "runtime": {
             "shapes": {
                 "batch_size": batch_size,
+                "batch_size_range": batch_size_range,
                 "token_len": token_len,
+                "token_len_range": token_len_range,
                 "label_count": label_count,
             },
             "coreml": {
                 "compute_units": args.coreml_compute_units,
                 "minimum_deployment_target": args.coreml_minimum_deployment_target,
                 "compute_precision": args.coreml_compute_precision,
+                "shape_mode": shape_mode,
             },
-            "driver_contract": _build_runtime_contract(runtime_assets["polyphonic_context_chars"]),
+            "driver_contract": _build_runtime_contract(
+                runtime_assets["polyphonic_context_chars"],
+                batch_size=batch_size,
+                token_len=token_len,
+                shape_mode=shape_mode,
+            ),
         },
     }
 
