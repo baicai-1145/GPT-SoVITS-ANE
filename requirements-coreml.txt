@@ -1,0 +1,2 @@
+coremltools>=8,<9
+onnx2torch>=1.5.15
