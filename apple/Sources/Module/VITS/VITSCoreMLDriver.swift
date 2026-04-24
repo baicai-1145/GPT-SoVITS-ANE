@@ -41,15 +41,21 @@ public struct VITSBundleManifest: Decodable {
             public let referFrameLen: Int
             public let referFrameCountRange: ShapeRange?
             public let semanticCodeLen: Int
+            public let semanticCodeLenRange: ShapeRange?
             public let textPhoneLen: Int
+            public let textPhoneLenRange: ShapeRange?
             public let latentLen: Int
+            public let latentLenRange: ShapeRange?
 
             private enum CodingKeys: String, CodingKey {
                 case referFrameLen = "refer_frame_len"
                 case referFrameCountRange = "refer_frame_count_range"
                 case semanticCodeLen = "semantic_code_len"
+                case semanticCodeLenRange = "semantic_code_len_range"
                 case textPhoneLen = "text_phone_len"
+                case textPhoneLenRange = "text_phone_len_range"
                 case latentLen = "latent_len"
+                case latentLenRange = "latent_len_range"
             }
         }
 

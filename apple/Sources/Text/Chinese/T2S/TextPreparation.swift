@@ -192,27 +192,37 @@ public final class GPTSoVITST2STextPreparer {
         bertInputName: String,
         kind: String
     ) throws -> GPTSoVITST2SPreparedTextInput {
-        let seqShape = try fixedShape(for: seqInputName, in: t2s.prefillModel)
-        let bertShape = try fixedShape(for: bertInputName, in: t2s.prefillModel)
-        guard seqShape.count == 2, seqShape[0] == 1 else {
-            throw GPTSoVITST2STextPreparationError.invalidShape(seqInputName)
-        }
-        guard bertShape.count == 2, bertShape[0] == 1024 else {
-            throw GPTSoVITST2STextPreparationError.invalidShape(bertInputName)
-        }
-        let phoneCapacity = seqShape[1]
-        guard bertShape[1] == phoneCapacity else {
-            throw GPTSoVITST2STextPreparationError.invalidShape(bertInputName)
-        }
-
         let phoneIDs = phoneResult.phoneIDs.map(Int32.init)
         let phoneCount = phoneIDs.count
-        guard phoneCount <= phoneCapacity else {
-            throw GPTSoVITST2STextPreparationError.phoneCountExceedsCapacity(
-                kind: kind,
-                phoneCount: phoneCount,
-                capacity: phoneCapacity
-            )
+        let dynamicPhoneCapacity = max(phoneCount, 1)
+
+        let seqShape: [Int]
+        let bertShape: [Int]
+        let phoneCapacity: Int
+        if usesDynamicT2SInput(for: seqInputName) {
+            seqShape = [1, dynamicPhoneCapacity]
+            bertShape = [1024, dynamicPhoneCapacity]
+            phoneCapacity = dynamicPhoneCapacity
+        } else {
+            seqShape = try fixedShape(for: seqInputName, in: t2s.prefillModel)
+            bertShape = try fixedShape(for: bertInputName, in: t2s.prefillModel)
+            guard seqShape.count == 2, seqShape[0] == 1 else {
+                throw GPTSoVITST2STextPreparationError.invalidShape(seqInputName)
+            }
+            guard bertShape.count == 2, bertShape[0] == 1024 else {
+                throw GPTSoVITST2STextPreparationError.invalidShape(bertInputName)
+            }
+            phoneCapacity = seqShape[1]
+            guard bertShape[1] == phoneCapacity else {
+                throw GPTSoVITST2STextPreparationError.invalidShape(bertInputName)
+            }
+            guard phoneCount <= phoneCapacity else {
+                throw GPTSoVITST2STextPreparationError.phoneCountExceedsCapacity(
+                    kind: kind,
+                    phoneCount: phoneCount,
+                    capacity: phoneCapacity
+                )
+            }
         }
 
         let paddedPhoneIDs = phoneIDs + Array(repeating: 0, count: phoneCapacity - phoneCount)
@@ -267,6 +277,20 @@ public final class GPTSoVITST2STextPreparer {
         let driver = try g2pwFactory()
         g2pwStorage = driver
         return driver
+    }
+
+    private func usesDynamicT2SInput(for inputName: String) -> Bool {
+        guard let shapes = t2s.manifest.runtime.shapes else {
+            return false
+        }
+        switch inputName {
+        case "ref_seq", "ref_bert":
+            return shapes.refPhoneLenRange != nil
+        case "text_seq", "text_bert":
+            return shapes.textPhoneLenRange != nil
+        default:
+            return false
+        }
     }
 
     private func fixedShape(for inputName: String, in model: MLModel) throws -> [Int] {

@@ -231,7 +231,7 @@ public final class ZhBertCharCoreMLDriver {
         }
         guard input.tokenCount <= fixedTokenCapacity else {
             throw NSError(domain: "ZhBertCharCoreMLDriver", code: 6, userInfo: [
-                NSLocalizedDescriptionKey: "Token count \(input.tokenCount) exceeds model capacity \(fixedTokenCapacity)."
+                NSLocalizedDescriptionKey: "Token count \(input.tokenCount) exceeds current zh_bert Core ML export capacity \(fixedTokenCapacity)."
             ])
         }
         if input.tokenCount == fixedTokenCapacity {
@@ -256,7 +256,7 @@ public final class ZhBertCharCoreMLDriver {
         let phoneCount = word2ph.reduce(0, +)
         guard phoneCount <= fixedPhoneCapacity else {
             throw NSError(domain: "ZhBertCharCoreMLDriver", code: 9, userInfo: [
-                NSLocalizedDescriptionKey: "Phone count \(phoneCount) exceeds model capacity \(fixedPhoneCapacity)."
+                NSLocalizedDescriptionKey: "Phone count \(phoneCount) exceeds current zh_bert Core ML export capacity \(fixedPhoneCapacity)."
             ])
         }
         guard let fixedTokenCapacity else {
@@ -265,7 +265,7 @@ public final class ZhBertCharCoreMLDriver {
         let charCapacity = max(fixedTokenCapacity - 2, 0)
         guard word2ph.count <= charCapacity else {
             throw NSError(domain: "ZhBertCharCoreMLDriver", code: 10, userInfo: [
-                NSLocalizedDescriptionKey: "word2ph length \(word2ph.count) exceeds model char capacity \(charCapacity)."
+                NSLocalizedDescriptionKey: "word2ph length \(word2ph.count) exceeds current zh_bert Core ML export char capacity \(charCapacity)."
             ])
         }
         return word2ph + Array(repeating: 0, count: charCapacity - word2ph.count)
@@ -307,6 +307,9 @@ public final class ZhBertCharCoreMLDriver {
     }
 
     private static func resolveFixedTokenCapacity(in model: MLModel) -> Int? {
+        if usesDynamicTokenInput(in: model) {
+            return nil
+        }
         guard let description = model.modelDescription.inputDescriptionsByName["input_ids"],
               let constraint = description.multiArrayConstraint else {
             return nil
@@ -316,6 +319,16 @@ public final class ZhBertCharCoreMLDriver {
             return nil
         }
         return shape[1]
+    }
+
+    private static func usesDynamicTokenInput(in model: MLModel) -> Bool {
+        guard let creatorDefined = model.modelDescription.metadata[.creatorDefinedKey] as? [String: Any] else {
+            return false
+        }
+        guard let rawValue = creatorDefined["gpt_sovits_dynamic_token_dim"] as? String else {
+            return false
+        }
+        return rawValue.lowercased() == "true"
     }
 
     private static func resolveFixedPhoneCapacity(in model: MLModel) -> Int? {

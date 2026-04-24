@@ -13,14 +13,20 @@ public struct CNHubertPreparedInput {
 
 public enum CNHubertInputPreparerError: LocalizedError {
     case invalidSampleRate(Int)
+    case rawReferenceLengthOutOfRange(actual: Int, lower: Int, upper: Int)
+    case activeInputLengthOutOfRange(active: Int, lower: Int, upper: Int)
     case inputLengthExceedsCapacity(active: Int, capacity: Int)
 
     public var errorDescription: String? {
         switch self {
         case let .invalidSampleRate(sampleRate):
             return "CNHuBERT 输入 sampleRate 必须为正数，收到 \(sampleRate)。"
+        case let .rawReferenceLengthOutOfRange(actual, lower, upper):
+            return "参考音频重采样到 16k 后长度=\(actual)，不在 Python 版要求的范围 [\(lower), \(upper)] 内。"
+        case let .activeInputLengthOutOfRange(active, lower, upper):
+            return "CNHuBERT active sample count=\(active)，不在当前 prompt Core ML 导出范围 [\(lower), \(upper)] 内。"
         case let .inputLengthExceedsCapacity(active, capacity):
-            return "CNHuBERT active sample count=\(active) 超过输入容量 \(capacity)。"
+            return "CNHuBERT active sample count=\(active) 超过当前 prompt Core ML 导出输入容量 \(capacity)。"
         }
     }
 }
@@ -29,15 +35,21 @@ public final class CNHubertInputPreparer {
     public let targetSampleRate: Int
     public let doNormalize: Bool
     public let trailingSilenceSampleCount: Int
+    public let rawReferenceSampleCountRange: ClosedRange<Int>?
+    public let activeInputSampleCountRange: ClosedRange<Int>?
 
     public init(
         targetSampleRate: Int = 16000,
         doNormalize: Bool = true,
-        trailingSilenceSampleCount: Int = 0
+        trailingSilenceSampleCount: Int = 0,
+        rawReferenceSampleCountRange: ClosedRange<Int>? = nil,
+        activeInputSampleCountRange: ClosedRange<Int>? = nil
     ) {
         self.targetSampleRate = targetSampleRate
         self.doNormalize = doNormalize
         self.trailingSilenceSampleCount = max(trailingSilenceSampleCount, 0)
+        self.rawReferenceSampleCountRange = rawReferenceSampleCountRange
+        self.activeInputSampleCountRange = activeInputSampleCountRange
     }
 
     private func resolvedSampleRateConverterAlgorithm() -> String {
@@ -89,6 +101,14 @@ public final class CNHubertInputPreparer {
             sourceRate: referenceAudio.sampleRate,
             targetRate: targetSampleRate
         )
+        if let rawReferenceSampleCountRange,
+           !rawReferenceSampleCountRange.contains(resampled.count) {
+            throw CNHubertInputPreparerError.rawReferenceLengthOutOfRange(
+                actual: resampled.count,
+                lower: rawReferenceSampleCountRange.lowerBound,
+                upper: rawReferenceSampleCountRange.upperBound
+            )
+        }
         let withTrailingSilence: [Float]
         if trailingSilenceSampleCount > 0 {
             withTrailingSilence = resampled + Array(repeating: 0, count: trailingSilenceSampleCount)
@@ -97,6 +117,14 @@ public final class CNHubertInputPreparer {
         }
         let normalized = doNormalize ? normalizeZeroMeanUnitVariance(withTrailingSilence) : withTrailingSilence
         let activeSampleCount = normalized.count
+        if let activeInputSampleCountRange,
+           !activeInputSampleCountRange.contains(activeSampleCount) {
+            throw CNHubertInputPreparerError.activeInputLengthOutOfRange(
+                active: activeSampleCount,
+                lower: activeInputSampleCountRange.lowerBound,
+                upper: activeInputSampleCountRange.upperBound
+            )
+        }
         let inputValues: [Float]
         let resolvedPaddedSampleCount: Int
         if let paddedSampleCount {

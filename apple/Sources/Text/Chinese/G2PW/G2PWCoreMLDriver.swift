@@ -22,13 +22,27 @@ public struct G2PWBundleManifest: Decodable {
 
     public struct Runtime: Decodable {
         public struct Shapes: Decodable {
+            public struct ShapeRange: Decodable {
+                public let lowerBound: Int
+                public let upperBound: Int
+
+                private enum CodingKeys: String, CodingKey {
+                    case lowerBound = "lower_bound"
+                    case upperBound = "upper_bound"
+                }
+            }
+
             public let batchSize: Int
+            public let batchSizeRange: ShapeRange?
             public let tokenLen: Int
+            public let tokenLenRange: ShapeRange?
             public let labelCount: Int
 
             private enum CodingKeys: String, CodingKey {
                 case batchSize = "batch_size"
+                case batchSizeRange = "batch_size_range"
                 case tokenLen = "token_len"
+                case tokenLenRange = "token_len_range"
                 case labelCount = "label_count"
             }
         }
@@ -366,8 +380,9 @@ public final class G2PWCoreMLDriver: GPTSoVITSG2PWPredicting {
         var predictions = [Int]()
         predictions.reserveCapacity(queryRows.count)
         var queryCursor = 0
+        let batchStride = max(manifest.runtime.shapes.batchSize, 1)
         while queryCursor < queryRows.count {
-            let batchEnd = min(queryCursor + manifest.runtime.shapes.batchSize, queryRows.count)
+            let batchEnd = min(queryCursor + batchStride, queryRows.count)
             predictions.append(contentsOf: try predictBatch(rows: Array(queryRows[queryCursor..<batchEnd])))
             queryCursor = batchEnd
         }
@@ -428,26 +443,42 @@ public final class G2PWCoreMLDriver: GPTSoVITSG2PWPredicting {
 
     private func predictBatch(rows: [PreparedQueryRow]) throws -> [Int] {
         guard let lastRow = rows.last else { return [] }
+        let usesDynamicBatchSize = usesDynamicBatchSize()
+        let usesDynamicTokenLength = usesDynamicTokenLength()
+        let batchSize = usesDynamicBatchSize ? rows.count : manifest.runtime.shapes.batchSize
         var paddedRows = rows
-        if paddedRows.count < manifest.runtime.shapes.batchSize {
-            paddedRows.append(contentsOf: Array(repeating: lastRow, count: manifest.runtime.shapes.batchSize - paddedRows.count))
+        if !usesDynamicBatchSize, paddedRows.count < batchSize {
+            paddedRows.append(contentsOf: Array(repeating: lastRow, count: batchSize - paddedRows.count))
         }
-
-        let batchSize = manifest.runtime.shapes.batchSize
-        let tokenLen = manifest.runtime.shapes.tokenLen
         let labelCount = manifest.runtime.shapes.labelCount
+        let tokenLen: Int
+        if usesDynamicTokenLength {
+            tokenLen = max(paddedRows.map { max($0.inputIDs.count, 1) }.max() ?? 1, 1)
+        } else {
+            tokenLen = manifest.runtime.shapes.tokenLen
+        }
+        let padTokenID = Int32(tokenizer.tokenID(for: "[PAD]"))
 
         let inputIDs = try makeInt32Array(
             shape: [batchSize, tokenLen],
-            values: paddedRows.flatMap(\.inputIDs)
+            values: paddedRows.flatMap { row in
+                let padding = tokenLen - row.inputIDs.count
+                return row.inputIDs + Array(repeating: padTokenID, count: padding)
+            }
         )
         let tokenTypeIDs = try makeInt32Array(
             shape: [batchSize, tokenLen],
-            values: paddedRows.flatMap(\.tokenTypeIDs)
+            values: paddedRows.flatMap { row in
+                let padding = tokenLen - row.tokenTypeIDs.count
+                return row.tokenTypeIDs + Array(repeating: 0, count: padding)
+            }
         )
         let attentionMask = try makeInt32Array(
             shape: [batchSize, tokenLen],
-            values: paddedRows.flatMap(\.attentionMask)
+            values: paddedRows.flatMap { row in
+                let padding = tokenLen - row.attentionMask.count
+                return row.attentionMask + Array(repeating: 0, count: padding)
+            }
         )
         let phonemeMask = try makeFloat32Array(
             shape: [batchSize, labelCount],
@@ -509,13 +540,11 @@ public final class G2PWCoreMLDriver: GPTSoVITSG2PWPredicting {
 
         let processedTokens = ["[CLS]"] + truncated.tokens + ["[SEP]"]
         let inputIDs = tokenizer.convertTokensToIDs(processedTokens).map(Int32.init)
-        guard inputIDs.count <= manifest.runtime.shapes.tokenLen else {
+        if let tokenUpperBound = resolvedTokenUpperBound(), inputIDs.count > tokenUpperBound {
             throw NSError(domain: "G2PWCoreMLDriver", code: 5, userInfo: [
-                NSLocalizedDescriptionKey: "Token count \(inputIDs.count) exceeds g2pw token capacity \(manifest.runtime.shapes.tokenLen)."
+                NSLocalizedDescriptionKey: "Token count \(inputIDs.count) exceeds current g2pw Core ML export token capacity \(tokenUpperBound)."
             ])
         }
-        let padding = manifest.runtime.shapes.tokenLen - inputIDs.count
-        let padTokenID = Int32(tokenizer.tokenID(for: "[PAD]"))
         let labelCount = manifest.runtime.shapes.labelCount
         var phonemeMask = Array(repeating: Float32(0), count: labelCount)
         for labelIndex in runtimeAssets.phonemeIndicesByCharID[charID] where labelIndex < labelCount {
@@ -523,9 +552,9 @@ public final class G2PWCoreMLDriver: GPTSoVITSG2PWPredicting {
         }
 
         return PreparedQueryRow(
-            inputIDs: inputIDs + Array(repeating: padTokenID, count: padding),
-            tokenTypeIDs: Array(repeating: 0, count: manifest.runtime.shapes.tokenLen),
-            attentionMask: Array(repeating: 1, count: inputIDs.count) + Array(repeating: 0, count: padding),
+            inputIDs: inputIDs,
+            tokenTypeIDs: Array(repeating: 0, count: inputIDs.count),
+            attentionMask: Array(repeating: 1, count: inputIDs.count),
             phonemeMask: phonemeMask,
             charID: Int32(charID),
             positionID: Int32(tokenIndex + 1),
@@ -537,7 +566,15 @@ public final class G2PWCoreMLDriver: GPTSoVITSG2PWPredicting {
         queryID: Int,
         tokenization: GPTSoVITSWordPieceTokenizationResult
     ) -> TruncatedQueryContext {
-        let truncateLen = manifest.runtime.shapes.tokenLen - 2
+        guard let tokenUpperBound = resolvedTokenUpperBound() else {
+            return TruncatedQueryContext(
+                text: text,
+                queryID: queryID,
+                tokens: tokenization.tokens,
+                textToToken: tokenization.textToToken
+            )
+        }
+        let truncateLen = max(tokenUpperBound - 2, 0)
         if tokenization.tokens.count <= truncateLen {
             return TruncatedQueryContext(
                 text: text,
@@ -661,5 +698,20 @@ public final class G2PWCoreMLDriver: GPTSoVITSG2PWPredicting {
 
     private static func loadModel(at url: URL, configuration: MLModelConfiguration) throws -> MLModel {
         try GPTSoVITSCoreMLModelLoader.loadModel(at: url, configuration: configuration)
+    }
+
+    private func usesDynamicBatchSize() -> Bool {
+        manifest.runtime.shapes.batchSizeRange != nil
+    }
+
+    private func usesDynamicTokenLength() -> Bool {
+        manifest.runtime.shapes.tokenLenRange != nil
+    }
+
+    private func resolvedTokenUpperBound() -> Int? {
+        if let tokenLenRange = manifest.runtime.shapes.tokenLenRange {
+            return tokenLenRange.upperBound < 0 ? nil : tokenLenRange.upperBound
+        }
+        return manifest.runtime.shapes.tokenLen
     }
 }

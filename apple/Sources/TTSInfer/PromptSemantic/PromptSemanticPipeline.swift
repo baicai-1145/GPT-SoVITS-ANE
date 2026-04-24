@@ -22,7 +22,7 @@ public enum GPTSoVITSPromptSemanticPipelineError: LocalizedError {
         case let .invalidShape(name):
             return "Prompt semantic 模型输入 \(name) 的 shape 不符合当前预期。"
         case let .promptCountExceedsCapacity(promptCount, capacity):
-            return "Prompt token count=\(promptCount) 超过容量 \(capacity)。"
+            return "Prompt token count=\(promptCount) 超过当前 prompt Core ML 导出容量 \(capacity)。"
         }
     }
 }
@@ -78,7 +78,13 @@ public final class GPTSoVITSPromptSemanticPipeline {
             inputPreparer: CNHubertInputPreparer(
                 targetSampleRate: bundle.manifest.runtime.audioInputContract.targetSampleRate,
                 doNormalize: bundle.manifest.runtime.audioInputContract.normalization.doNormalize,
-                trailingSilenceSampleCount: bundle.manifest.runtime.audioInputContract.trailingSilenceSampleCount
+                trailingSilenceSampleCount: bundle.manifest.runtime.audioInputContract.trailingSilenceSampleCount,
+                rawReferenceSampleCountRange: bundle.manifest.runtime.audioInputContract
+                    .rawReferenceSampleCountRange?
+                    .closedRange,
+                activeInputSampleCountRange: bundle.manifest.runtime.audioInputContract
+                    .activeInputSampleCountRange?
+                    .closedRange
             ),
             bundle: bundle
         )

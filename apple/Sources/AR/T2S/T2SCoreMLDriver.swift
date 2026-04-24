@@ -27,6 +27,34 @@ public struct T2SBundleManifest: Decodable {
     }
 
     public struct Runtime: Decodable {
+        public struct Shapes: Decodable {
+            public struct ShapeRange: Decodable {
+                public let lowerBound: Int
+                public let upperBound: Int
+
+                private enum CodingKeys: String, CodingKey {
+                    case lowerBound = "lower_bound"
+                    case upperBound = "upper_bound"
+                }
+            }
+
+            public let promptLen: Int?
+            public let promptLenRange: ShapeRange?
+            public let refPhoneLen: Int?
+            public let refPhoneLenRange: ShapeRange?
+            public let textPhoneLen: Int?
+            public let textPhoneLenRange: ShapeRange?
+
+            private enum CodingKeys: String, CodingKey {
+                case promptLen = "prompt_len"
+                case promptLenRange = "prompt_len_range"
+                case refPhoneLen = "ref_phone_len"
+                case refPhoneLenRange = "ref_phone_len_range"
+                case textPhoneLen = "text_phone_len"
+                case textPhoneLenRange = "text_phone_len_range"
+            }
+        }
+
         public struct SamplingDefaults: Decodable {
             public let mode: String?
             public let topK: Int?
@@ -48,6 +76,7 @@ public struct T2SBundleManifest: Decodable {
         public let prefillExportMode: String?
         public let decodeExportMode: String?
         public let samplingDefaults: SamplingDefaults?
+        public let shapes: Shapes?
 
         private enum CodingKeys: String, CodingKey {
             case eosToken = "eos_token"
@@ -55,6 +84,7 @@ public struct T2SBundleManifest: Decodable {
             case prefillExportMode = "prefill_export_mode"
             case decodeExportMode = "decode_export_mode"
             case samplingDefaults = "sampling_defaults"
+            case shapes
         }
     }
 

@@ -58,7 +58,7 @@ public enum GPTSoVITSChineseSynthesisPipelineError: LocalizedError {
         case let .invalidShape(name):
             return "T2S 模型输入 \(name) 的 shape 不符合当前预期。"
         case let .promptCountExceedsCapacity(promptCount, capacity):
-            return "prompt token count=\(promptCount) 超过 T2S 输入容量 \(capacity)。"
+            return "prompt token count=\(promptCount) 超过当前 T2S Core ML 导出输入容量 \(capacity)。"
         case .promptConditioningUnavailable:
             return "当前 GPTSoVITSChineseSynthesisPipeline 没有配置 cnhubert + ssl_latent prompt 提取链。"
         }
@@ -671,6 +671,11 @@ public final class GPTSoVITSChineseSynthesisPipeline {
     }
 
     private func makePaddedPrompts(_ prompts: [Int32]) throws -> MLMultiArray {
+        if speakerConditioned.t2s.manifest.runtime.shapes?.promptLenRange != nil {
+            let shape = [1, max(prompts.count, 1)]
+            let values = prompts + Array(repeating: 0, count: shape[1] - prompts.count)
+            return try speakerConditioned.t2s.makeInt32Array(shape: shape, values: values)
+        }
         let shape = try fixedShape(for: "prompts", in: speakerConditioned.t2s.prefillModel)
         guard shape.count == 2, shape[0] == 1 else {
             throw GPTSoVITSChineseSynthesisPipelineError.invalidShape("prompts")

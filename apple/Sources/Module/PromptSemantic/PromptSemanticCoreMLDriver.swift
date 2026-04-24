@@ -52,6 +52,20 @@ public struct PromptSemanticBundleManifest: Decodable {
         }
 
         public struct AudioInputContract: Decodable {
+            public struct ShapeRange: Decodable {
+                public let lowerBound: Int
+                public let upperBound: Int
+
+                public var closedRange: ClosedRange<Int> {
+                    lowerBound...upperBound
+                }
+
+                private enum CodingKeys: String, CodingKey {
+                    case lowerBound = "lower_bound"
+                    case upperBound = "upper_bound"
+                }
+            }
+
             public struct Normalization: Decodable {
                 public let source: String
                 public let doNormalize: Bool
@@ -77,6 +91,8 @@ public struct PromptSemanticBundleManifest: Decodable {
             public let channelPolicy: String
             public let targetSampleRate: Int
             public let trailingSilenceSampleCount: Int
+            public let rawReferenceSampleCountRange: ShapeRange?
+            public let activeInputSampleCountRange: ShapeRange?
             public let normalization: Normalization
             public let padding: Padding
 
@@ -84,6 +100,8 @@ public struct PromptSemanticBundleManifest: Decodable {
                 case channelPolicy = "channel_policy"
                 case targetSampleRate = "target_sample_rate"
                 case trailingSilenceSampleCount = "trailing_silence_sample_count"
+                case rawReferenceSampleCountRange = "raw_reference_sample_count_range"
+                case activeInputSampleCountRange = "active_input_sample_count_range"
                 case normalization
                 case padding
             }

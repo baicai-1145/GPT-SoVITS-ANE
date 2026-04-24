@@ -21,11 +21,23 @@ public struct EnglishFrontendBundleManifest: Decodable {
 
     public struct Runtime: Decodable {
         public struct Shapes: Decodable {
+            public struct ShapeRange: Decodable {
+                public let lowerBound: Int
+                public let upperBound: Int
+
+                private enum CodingKeys: String, CodingKey {
+                    case lowerBound = "lower_bound"
+                    case upperBound = "upper_bound"
+                }
+            }
+
             public let maxWordLen: Int
+            public let wordLenRange: ShapeRange?
             public let maxDecodeLen: Int
 
             private enum CodingKeys: String, CodingKey {
                 case maxWordLen = "max_word_len"
+                case wordLenRange = "word_len_range"
                 case maxDecodeLen = "max_decode_len"
             }
         }
@@ -94,7 +106,7 @@ public enum EnglishPhoneFrontendError: LocalizedError {
         case let .unsupportedLanguage(language):
             return "EnglishCoreMLPhoneBackend 只支持英文主链，收到 language=\(language)"
         case let .predictorInputTooLong(word):
-            return "English OOV predictor 输入过长，当前无法处理单词: \(word)"
+            return "English OOV predictor 单词输入超过当前 Core ML 导出容量，无法处理: \(word)"
         case let .missingModelOutput(name):
             return "English OOV predictor 缺少输出: \(name)"
         }
@@ -370,7 +382,7 @@ public final class EnglishCoreMLPhoneBackend: GPTSoVITSTextPhoneBackend {
 
     private func predictOOV(token: String) throws -> [String] {
         let ids = try encodeWord(token)
-        let inputIDs = try makeInt32Array(shape: [1, manifest.runtime.shapes.maxWordLen], values: ids.paddedIDs)
+        let inputIDs = try makeInt32Array(shape: [1, ids.storageIDs.count], values: ids.storageIDs)
         let inputLength = try makeInt32Array(shape: [1], values: [ids.length])
         let provider = try MLDictionaryFeatureProvider(dictionary: [
             "input_ids": MLFeatureValue(multiArray: inputIDs),
@@ -393,10 +405,13 @@ public final class EnglishCoreMLPhoneBackend: GPTSoVITSTextPhoneBackend {
         return phones
     }
 
-    private func encodeWord(_ word: String) throws -> (paddedIDs: [Int32], length: Int32) {
+    private func encodeWord(_ word: String) throws -> (storageIDs: [Int32], length: Int32) {
         let tokens = Array(word).map { graphemeToID[String($0)] ?? unkID } + [graphemeToID["</s>"] ?? 2]
-        guard tokens.count <= manifest.runtime.shapes.maxWordLen else {
+        if let wordUpperBound = resolvedWordUpperBound(), tokens.count > wordUpperBound {
             throw EnglishPhoneFrontendError.predictorInputTooLong(word)
+        }
+        if usesDynamicWordLength() {
+            return (tokens.map(Int32.init), Int32(tokens.count))
         }
         let padded = tokens + Array(repeating: graphemeToID["<pad>"] ?? 0, count: manifest.runtime.shapes.maxWordLen - tokens.count)
         return (padded.map(Int32.init), Int32(tokens.count))
@@ -413,6 +428,17 @@ public final class EnglishCoreMLPhoneBackend: GPTSoVITSTextPhoneBackend {
 
     private static func loadModel(at url: URL, configuration: MLModelConfiguration) throws -> MLModel {
         try GPTSoVITSCoreMLModelLoader.loadModel(at: url, configuration: configuration)
+    }
+
+    private func usesDynamicWordLength() -> Bool {
+        manifest.runtime.shapes.wordLenRange != nil
+    }
+
+    private func resolvedWordUpperBound() -> Int? {
+        if let wordLenRange = manifest.runtime.shapes.wordLenRange {
+            return wordLenRange.upperBound < 0 ? nil : wordLenRange.upperBound
+        }
+        return manifest.runtime.shapes.maxWordLen
     }
 
     private static func tokenize(_ text: String) -> [TokenUnit] {

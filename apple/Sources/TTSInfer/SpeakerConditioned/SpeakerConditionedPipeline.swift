@@ -30,7 +30,7 @@ public enum GPTSoVITSSpeakerConditionedPipelineError: LocalizedError {
         case let .invalidShape(name):
             return "VITS 模型输入 \(name) 的 shape 不符合当前预期。"
         case let .vitsTextPhoneCountExceedsCapacity(phoneCount, capacity):
-            return "VITS text phone_count=\(phoneCount) 超过输入容量 \(capacity)。"
+            return "VITS text phone_count=\(phoneCount) 超过当前 VITS Core ML 导出输入容量 \(capacity)。"
         }
     }
 }
@@ -96,7 +96,9 @@ public final class GPTSoVITSSpeakerConditionedPipeline {
         seed: UInt64? = nil,
         samplingRNGBox: T2SSamplingRNGBox? = nil
     ) throws -> GPTSoVITSSpeakerConditionedResult {
-        let semanticCodeCapacity = vits.vits.manifest.runtime.shapes.semanticCodeLen
+        let semanticCodeCapacity = usesDynamicSemanticCodeLength()
+            ? nil
+            : vits.vits.manifest.runtime.shapes.semanticCodeLen
         var t2sState = try t2s.prefill(
             prompts: prompts,
             promptLength: promptLength,
@@ -113,7 +115,7 @@ public final class GPTSoVITSSpeakerConditionedPipeline {
         let initialSemanticToken = Int32(truncating: t2sState.lastToken[0])
         let decodedSemanticTokens = initialSemanticToken == eosToken ? [] : try t2s.decodeGreedy(
             state: &t2sState,
-            limit: max(semanticCodeCapacity - 1, 0),
+            limit: max((semanticCodeCapacity ?? t2s.manifest.runtime.maxDecodeSteps) - 1, 0),
             stopOnEOS: true
         )
         let resolvedSemanticCodes = Self.resolveSemanticCodes(
@@ -124,7 +126,7 @@ public final class GPTSoVITSSpeakerConditionedPipeline {
         )
 
         let codes = try vits.vits.makeInt32Array(
-            shape: [1, 1, semanticCodeCapacity],
+            shape: [1, 1, resolvedSemanticCodes.paddedCodes.count],
             values: resolvedSemanticCodes.paddedCodes
         )
         let resolvedVITSText = try resolveVITSText(vitsText, explicitLength: vitsTextLength)
@@ -219,6 +221,11 @@ public final class GPTSoVITSSpeakerConditionedPipeline {
     }
 
     public func makePaddedVITSText(phoneIDs: [Int32]) throws -> MLMultiArray {
+        if usesDynamicVITSTextLength() {
+            let shape = [1, max(phoneIDs.count, 1)]
+            let values = phoneIDs + Array(repeating: 0, count: shape[1] - phoneIDs.count)
+            return try vits.vits.makeInt32Array(shape: shape, values: values)
+        }
         let shape = try fixedShape(for: "text", in: vits.vits.priorModel)
         guard shape.count == 2, shape[0] == 1 else {
             throw GPTSoVITSSpeakerConditionedPipelineError.invalidShape("text")
@@ -238,22 +245,26 @@ public final class GPTSoVITSSpeakerConditionedPipeline {
         initialToken: Int32,
         decodedTokens: [Int32],
         eosToken: Int32,
-        targetLength: Int
+        targetLength: Int?
     ) -> GPTSoVITSResolvedSemanticCodes {
         var semanticCodes = [Int32]()
-        semanticCodes.reserveCapacity(targetLength)
-        if initialToken != eosToken, semanticCodes.count < targetLength {
+        semanticCodes.reserveCapacity(targetLength ?? max(decodedTokens.count + 1, 1))
+        if initialToken != eosToken, semanticCodes.count < (targetLength ?? Int.max) {
             semanticCodes.append(initialToken)
         }
         for token in decodedTokens {
-            if token == eosToken || semanticCodes.count >= targetLength {
+            if token == eosToken || semanticCodes.count >= (targetLength ?? Int.max) {
                 break
             }
             semanticCodes.append(token)
         }
+        if let targetLength, semanticCodes.count > targetLength {
+            semanticCodes = Array(semanticCodes.prefix(targetLength))
+        }
+        let storageCount = max(targetLength ?? semanticCodes.count, 1)
         var paddedCodes = semanticCodes
-        if paddedCodes.count < targetLength {
-            paddedCodes.append(contentsOf: Array(repeating: 0, count: targetLength - paddedCodes.count))
+        if paddedCodes.count < storageCount {
+            paddedCodes.append(contentsOf: Array(repeating: 0, count: storageCount - paddedCodes.count))
         }
         return GPTSoVITSResolvedSemanticCodes(
             semanticCodes: semanticCodes,
@@ -266,13 +277,11 @@ public final class GPTSoVITSSpeakerConditionedPipeline {
         _ explicitText: MLMultiArray?,
         explicitLength: Int?
     ) throws -> GPTSoVITSResolvedVITSText {
-        let expectedShape = try fixedShape(for: "text", in: vits.vits.priorModel)
-        guard expectedShape.count == 2, expectedShape[0] == 1 else {
-            throw GPTSoVITSSpeakerConditionedPipelineError.invalidShape("text")
-        }
-        let phoneCapacity = expectedShape[1]
+        let usesDynamicLength = usesDynamicVITSTextLength()
         if let explicitText {
             try validateVITSTextShape(explicitText)
+            let actualShape = explicitText.shape.map { Int(truncating: $0) }
+            let phoneCapacity = actualShape[1]
             let phoneCount = explicitLength ?? phoneCapacity
             guard phoneCount >= 0, phoneCount <= phoneCapacity else {
                 throw GPTSoVITSSpeakerConditionedPipelineError.vitsTextPhoneCountExceedsCapacity(
@@ -282,6 +291,16 @@ public final class GPTSoVITSSpeakerConditionedPipeline {
             }
             return GPTSoVITSResolvedVITSText(array: explicitText, phoneCount: phoneCount)
         }
+        if usesDynamicLength {
+            return GPTSoVITSResolvedVITSText(
+                array: try makePaddedVITSText(phoneIDs: []),
+                phoneCount: 0
+            )
+        }
+        let expectedShape = try fixedShape(for: "text", in: vits.vits.priorModel)
+        guard expectedShape.count == 2, expectedShape[0] == 1 else {
+            throw GPTSoVITSSpeakerConditionedPipelineError.invalidShape("text")
+        }
         return GPTSoVITSResolvedVITSText(
             array: try makePaddedVITSText(phoneIDs: []),
             phoneCount: 0
@@ -289,11 +308,25 @@ public final class GPTSoVITSSpeakerConditionedPipeline {
     }
 
     private func validateVITSTextShape(_ text: MLMultiArray) throws {
-        let expectedShape = try fixedShape(for: "text", in: vits.vits.priorModel)
         let actualShape = text.shape.map { Int(truncating: $0) }
+        if usesDynamicVITSTextLength() {
+            guard actualShape.count == 2, actualShape[0] == 1, actualShape[1] >= 1 else {
+                throw GPTSoVITSSpeakerConditionedPipelineError.invalidShape("text")
+            }
+            return
+        }
+        let expectedShape = try fixedShape(for: "text", in: vits.vits.priorModel)
         guard actualShape == expectedShape else {
             throw GPTSoVITSSpeakerConditionedPipelineError.invalidShape("text")
         }
+    }
+
+    private func usesDynamicSemanticCodeLength() -> Bool {
+        vits.vits.manifest.runtime.shapes.semanticCodeLenRange != nil
+    }
+
+    private func usesDynamicVITSTextLength() -> Bool {
+        vits.vits.manifest.runtime.shapes.textPhoneLenRange != nil
     }
 
     private func fixedShape(for inputName: String, in model: MLModel) throws -> [Int] {
